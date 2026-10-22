@@ -3,6 +3,8 @@
 **Status**: Draft
 **Branch**: `topic/gh012934/codex-vmop-policy-cleanup`
 **Epic**: TBD
+**Story**: vmop-44758
+**Task**: vmop-44836
 
 ## Goals
 
