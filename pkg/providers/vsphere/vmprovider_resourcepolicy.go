@@ -48,7 +48,12 @@ func (vs *vSphereVMProvider) CreateOrUpdateVirtualMachineSetResourcePolicy(
 		}
 	}
 
-	resourcePolicy.Status.ResourcePools = nil
+	// Replace this process's entries. In multi-vCenter shard mode the other
+	// shards' entries are for clusters in other vCenters, and are kept.
+	resourcePolicy.Status.ResourcePools = slices.DeleteFunc(resourcePolicy.Status.ResourcePools,
+		func(rp vmopv1.ResourcePoolStatus) bool {
+			return clustermodules.IsOwnStatusEntry(ctx, rp.ClusterMoID)
+		})
 	clusterModuleProvider := clustermodules.NewProvider(client.RestClient())
 	clusterMoIDs := sets.New[string]()
 
@@ -59,14 +64,14 @@ func (vs *vSphereVMProvider) CreateOrUpdateVirtualMachineSetResourcePolicy(
 			continue
 		}
 
-		clusterMoIDs.Insert(clusterRef.Value)
+		clusterMoIDs.Insert(clustermodules.StatusClusterKey(ctx, clusterRef))
 
 		if rpSpec := &resourcePolicy.Spec.ResourcePool; rpSpec.Name != "" {
 			childRPMoID, err := vcenter.CreateOrUpdateChildResourcePool(ctx, vimClient, rpMoID, rpSpec)
 			if err == nil {
 				resourcePolicy.Status.ResourcePools = append(resourcePolicy.Status.ResourcePools,
 					vmopv1.ResourcePoolStatus{
-						ClusterMoID:           clusterRef.Value,
+						ClusterMoID:           clustermodules.StatusClusterKey(ctx, clusterRef),
 						ChildResourcePoolMoID: childRPMoID,
 					})
 			} else {
@@ -88,7 +93,8 @@ func (vs *vSphereVMProvider) CreateOrUpdateVirtualMachineSetResourcePolicy(
 		// created for this CCR.
 		resourcePolicy.Status.ClusterModules = slices.DeleteFunc(resourcePolicy.Status.ClusterModules,
 			func(cm vmopv1.VSphereClusterModuleStatus) bool {
-				if cm.ClusterMoID == "" || clusterMoIDs.Has(cm.ClusterMoID) {
+				if cm.ClusterMoID == "" || clusterMoIDs.Has(cm.ClusterMoID) ||
+					!clustermodules.IsOwnStatusEntry(ctx, cm.ClusterMoID) {
 					return false
 				}
 
@@ -190,12 +196,12 @@ func (vs *vSphereVMProvider) createClusterModules(
 
 		if idx >= 0 {
 			resourcePolicy.Status.ClusterModules[idx].ModuleUuid = moduleID
-			resourcePolicy.Status.ClusterModules[idx].ClusterMoID = clusterRef.Value
+			resourcePolicy.Status.ClusterModules[idx].ClusterMoID = clustermodules.StatusClusterKey(ctx, clusterRef)
 		} else {
 			status := vmopv1.VSphereClusterModuleStatus{
 				GroupName:   groupName,
 				ModuleUuid:  moduleID,
-				ClusterMoID: clusterRef.Value,
+				ClusterMoID: clustermodules.StatusClusterKey(ctx, clusterRef),
 			}
 			resourcePolicy.Status.ClusterModules = append(resourcePolicy.Status.ClusterModules, status)
 		}
@@ -214,6 +220,11 @@ func (vs *vSphereVMProvider) deleteClusterModules(
 	var errs []error
 
 	for _, moduleStatus := range resourcePolicy.Status.ClusterModules {
+		if moduleStatus.ClusterMoID != "" && !clustermodules.IsOwnStatusEntry(ctx, moduleStatus.ClusterMoID) {
+			// Another shard's module, in another vCenter.
+			errModStatus = append(errModStatus, moduleStatus)
+			continue
+		}
 		err := clusterModProvider.DeleteModule(ctx, moduleStatus.ModuleUuid)
 		if err != nil {
 			errModStatus = append(errModStatus, moduleStatus)
