@@ -24,6 +24,7 @@ import (
 	pkgcfg "github.com/vmware-tanzu/vm-operator/pkg/config"
 	pkgctx "github.com/vmware-tanzu/vm-operator/pkg/context"
 	pkglog "github.com/vmware-tanzu/vm-operator/pkg/log"
+	"github.com/vmware-tanzu/vm-operator/pkg/multivc"
 	"github.com/vmware-tanzu/vm-operator/pkg/patch"
 	"github.com/vmware-tanzu/vm-operator/pkg/providers"
 )
@@ -49,6 +50,8 @@ func AddToManager(ctx *pkgctx.ControllerManagerContext, mgr manager.Manager) err
 		ctx.VMProvider,
 	)
 
+	r.APIReader = mgr.GetAPIReader()
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(controlledType).
 		Watches(
@@ -69,6 +72,7 @@ func NewReconciler(
 	return &Reconciler{
 		Context:    ctx,
 		Client:     client,
+		APIReader:  client,
 		Logger:     logger,
 		VMProvider: vmProvider,
 	}
@@ -97,7 +101,9 @@ func zoneToNamespaceVMSRP(
 
 // Reconciler reconciles a VirtualMachineSetResourcePolicy object.
 type Reconciler struct {
-	Context context.Context
+	// APIReader bypasses the cache when retrying a shared status write.
+	APIReader client.Reader
+	Context   context.Context
 	client.Client
 	Logger     logr.Logger
 	VMProvider providers.VirtualMachineProviderInterface
@@ -194,12 +200,32 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Re
 		ResourcePolicy: rp,
 	}
 
+	before := rp.DeepCopy()
 	patchHelper, err := patch.NewHelper(rp, r.Client)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to init patch helper for %s: %w", rpCtx, err)
 	}
 	defer func() {
-		if err := patchHelper.Patch(ctx, rp); err != nil {
+		patchObject := rp
+		if pkgcfg.FromContext(ctx).MultiVC.IsShard() {
+			reader := r.APIReader
+			if reader == nil {
+				reader = r.Client
+			}
+			if err := multivc.PatchResourcePolicyStatus(ctx, r.Client, reader, before, rp); err != nil {
+				if reterr == nil {
+					reterr = err
+				}
+				rpCtx.Logger.Error(err, "shard status patch failed")
+				// Keep the finalizer if status persistence failed after cleanup.
+				return
+			}
+			// The lists have already been merged under optimistic locking.
+			// Leave only metadata/spec changes for the ordinary patch helper.
+			patchObject = rp.DeepCopy()
+			patchObject.Status = before.Status
+		}
+		if err := patchHelper.Patch(ctx, patchObject); err != nil {
 			if reterr == nil {
 				reterr = err
 			}
