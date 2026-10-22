@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	topologyv1 "github.com/vmware-tanzu/vm-operator/external/tanzu-topology/api/v1alpha1"
@@ -183,11 +185,12 @@ func GetAvailabilityZones(
 		return nil, err
 	}
 
-	if len(availabilityZoneList.Items) == 0 {
+	items := ownedOnly(ctx, availabilityZoneList.Items)
+	if len(items) == 0 {
 		return nil, ErrNoAvailabilityZones
 	}
 
-	return availabilityZoneList.Items, nil
+	return items, nil
 }
 
 // GetAvailabilityZone returns a named AvailabilityZone resource.
@@ -197,6 +200,9 @@ func GetAvailabilityZone(
 	availabilityZoneName string) (topologyv1.AvailabilityZone, error) {
 
 	var availabilityZone topologyv1.AvailabilityZone
+	if !pkgcfg.FromContext(ctx).MultiVC.OwnsZone(availabilityZoneName) {
+		return availabilityZone, notOwnedError("availabilityzones", availabilityZoneName)
+	}
 	err := client.Get(ctx, ctrlclient.ObjectKey{Name: availabilityZoneName}, &availabilityZone)
 	return availabilityZone, err
 }
@@ -212,11 +218,12 @@ func GetZones(
 		return nil, err
 	}
 
-	if len(zoneList.Items) == 0 {
+	items := ownedOnly(ctx, zoneList.Items)
+	if len(items) == 0 {
 		return nil, ErrNoZones
 	}
 
-	return zoneList.Items, nil
+	return items, nil
 }
 
 // GetZone returns a namespaced Zone resource.
@@ -227,6 +234,38 @@ func GetZone(
 	namespace string) (topologyv1.Zone, error) {
 
 	var zone topologyv1.Zone
+	if !pkgcfg.FromContext(ctx).MultiVC.OwnsZone(zoneName) {
+		return zone, notOwnedError("zones", zoneName)
+	}
 	err := client.Get(ctx, ctrlclient.ObjectKey{Name: zoneName, Namespace: namespace}, &zone)
 	return zone, err
+}
+
+// ownedOnly returns the items whose zone this process owns. Outside the
+// multi-vCenter shard mode that is every item. A Zone has the name of its
+// AvailabilityZone, so both are filtered by name.
+func ownedOnly[T any, PT interface {
+	*T
+	GetName() string
+}](ctx context.Context, items []T) []T {
+
+	multiVC := pkgcfg.FromContext(ctx).MultiVC
+	if !multiVC.IsShard() {
+		return items
+	}
+	owned := make([]T, 0, len(items))
+	for i := range items {
+		if multiVC.OwnsZone(PT(&items[i]).GetName()) {
+			owned = append(owned, items[i])
+		}
+	}
+	return owned
+}
+
+// notOwnedError returns a NotFound error for a zone that another shard owns,
+// so callers handle it as they handle a zone that does not exist.
+func notOwnedError(resource, name string) error {
+	return apierrors.NewNotFound(
+		schema.GroupResource{Group: topologyv1.GroupVersion.Group, Resource: resource},
+		name)
 }
