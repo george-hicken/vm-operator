@@ -15,7 +15,7 @@ import (
 )
 
 // ErrTopologyChanged is returned by the topology watcher when the shard's
-// zones, the primary SDDC, or the shard's vCenter endpoint changed. The shard
+// zones, the set of SDDCs, or the shard's vCenter endpoint changed. The shard
 // exits, and the restarted process builds its cache selector and vCenter
 // client from the new topology.
 var ErrTopologyChanged = errors.New("multi-vCenter topology changed; restarting the shard")
@@ -52,8 +52,8 @@ func NewTopologyWatcher(
 			}
 			if fp := t.Fingerprint(); fp != startFingerprint {
 				logger.Info("Multi-vCenter topology changed",
-					"sddc", shardSDDC, "primary", t.Primary,
-					"ownedZones", t.Owned, "foreignZones", t.Foreign)
+					"sddc", shardSDDC, "sddcs", t.SDDCs,
+					"ownedZones", t.Owned)
 				return ErrTopologyChanged
 			}
 		}

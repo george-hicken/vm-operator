@@ -109,27 +109,6 @@ func FindSDDC(sddcs []SDDC, name string) (SDDC, error) {
 	return SDDC{}, fmt.Errorf("%w: %q", ErrSDDCNotFound, name)
 }
 
-// PrimarySDDC returns the name of the primary SDDC: the oldest SDDC by
-// creation time, with ties broken by name. The SDDC created when the
-// Supervisor is enabled is older than any SDDC a later join adds, so it is the
-// primary. The primary shard owns the zones that no SDDC owns and the VMs that
-// have no zone.
-func PrimarySDDC(sddcs []SDDC) string {
-	if len(sddcs) == 0 {
-		return ""
-	}
-	primary := sddcs[0]
-	for _, s := range sddcs[1:] {
-		switch {
-		case s.CreationTimestamp.Before(&primary.CreationTimestamp):
-			primary = s
-		case s.CreationTimestamp.Equal(&primary.CreationTimestamp) && s.Name < primary.Name:
-			primary = s
-		}
-	}
-	return primary.Name
-}
-
 // Endpoint returns the vCenter host and port from the SDDC's endpoint URL. A
 // URL without a port uses 443.
 func (s SDDC) Endpoint() (string, string, error) {

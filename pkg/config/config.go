@@ -203,7 +203,7 @@ const (
 
 // MultiVC is the multi-vCenter configuration of a VM Operator process.
 //
-// The zone lists are comma-delimited strings rather than slices for the
+// The zone list is a comma-delimited string rather than a slice for the
 // reason given in the GoDocs for the Config type.
 type MultiVC struct {
 	// Mode is the part of the deployment this process runs.
@@ -213,17 +213,15 @@ type MultiVC struct {
 	// only in shard mode.
 	ShardSDDC string
 
-	// Primary is true for the shard of the primary SDDC. The primary shard
-	// also owns the zones that no SDDC owns, and VMs that have no zone.
-	Primary bool
+	// Sole is true for a shard whose SDDC is the only SDDC of the
+	// Supervisor. A sole shard owns every zone and every VM, including VMs
+	// without a zone, which is the single-vCenter behavior. Once a second
+	// SDDC exists, no shard owns a VM without a zone.
+	Sole bool
 
 	// OwnedZones is the comma-delimited list of the zones whose
 	// AvailabilityZone is owned by ShardSDDC.
 	OwnedZones string
-
-	// ForeignZones is the comma-delimited list of the zones whose
-	// AvailabilityZone is owned by another SDDC.
-	ForeignZones string
 }
 
 // IsShard returns true when the process runs in shard mode.
@@ -249,15 +247,12 @@ func (m MultiVC) HasVCClient() bool {
 }
 
 // OwnsZone returns true when the process is responsible for the named zone.
-// Outside shard mode every zone is owned.
+// Outside shard mode, and in a sole shard, every zone is owned.
 func (m MultiVC) OwnsZone(name string) bool {
-	if !m.IsShard() {
+	if !m.IsShard() || m.Sole {
 		return true
 	}
-	if slices.Contains(StringToSlice(m.OwnedZones), name) {
-		return true
-	}
-	return m.Primary && !slices.Contains(StringToSlice(m.ForeignZones), name)
+	return slices.Contains(StringToSlice(m.OwnedZones), name)
 }
 
 // GetMaxDeployThreadsOnProvider returns MaxDeployThreadsOnProvider if it is >0

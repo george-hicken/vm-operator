@@ -75,13 +75,12 @@ var _ = Describe("Zones in multi-vCenter shard mode", func() {
 		})
 	})
 
-	When("the process is a non-primary shard", func() {
+	When("the process is a shard and several SDDCs exist", func() {
 		BeforeEach(func() {
 			multiVC = pkgcfg.MultiVC{
-				Mode:         pkgcfg.MultiVCModeShard,
-				ShardSDDC:    "vc-2",
-				OwnedZones:   "zone-2",
-				ForeignZones: "zone-1",
+				Mode:       pkgcfg.MultiVCModeShard,
+				ShardSDDC:  "vc-2",
+				OwnedZones: "zone-2",
 			}
 		})
 
@@ -109,35 +108,28 @@ var _ = Describe("Zones in multi-vCenter shard mode", func() {
 		})
 	})
 
-	When("the process is the primary shard", func() {
+	When("the process is the sole shard", func() {
 		BeforeEach(func() {
 			multiVC = pkgcfg.MultiVC{
-				Mode:         pkgcfg.MultiVCModeShard,
-				ShardSDDC:    "vc-1",
-				Primary:      true,
-				OwnedZones:   "zone-1",
-				ForeignZones: "zone-2",
+				Mode:       pkgcfg.MultiVCModeShard,
+				ShardSDDC:  "vc-1",
+				Sole:       true,
+				OwnedZones: "zone-1",
 			}
 		})
 
-		It("Should return its zones and the unowned zones", func() {
+		It("Should return every zone, as a single-vCenter VM Operator does", func() {
 			zones, err := topology.GetZones(ctx, client, namespace)
 			Expect(err).ToNot(HaveOccurred())
-			Expect(names(zones)).To(ConsistOf("zone-1", "zone-new"))
-
-			_, err = topology.GetZone(ctx, client, "zone-new", namespace)
-			Expect(err).ToNot(HaveOccurred())
-			_, err = topology.GetZone(ctx, client, "zone-2", namespace)
-			Expect(apierrors.IsNotFound(err)).To(BeTrue())
+			Expect(names(zones)).To(ConsistOf("zone-1", "zone-2", "zone-new"))
 		})
 	})
 
 	When("a shard owns no zone", func() {
 		BeforeEach(func() {
 			multiVC = pkgcfg.MultiVC{
-				Mode:         pkgcfg.MultiVCModeShard,
-				ShardSDDC:    "vc-3",
-				ForeignZones: "zone-1,zone-2",
+				Mode:      pkgcfg.MultiVCModeShard,
+				ShardSDDC: "vc-3",
 			}
 		})
 

@@ -11,15 +11,18 @@
 //
 //   - identity: the mode a process runs in and the SDDC a shard serves.
 //   - membership: the SDDCs of the Supervisor, read from their SDDC
-//     resources, and which of them is primary.
+//     resources, and whether a shard's SDDC is the only one.
 //   - resolver: the SDDC a zone belongs to, through the owner reference of
 //     its AvailabilityZone.
 //   - selector: the label selector that limits a shard's VM cache to the VMs
 //     in its zones.
 //   - client provider: the vCenter endpoint, trust and identity of a shard's
 //     SDDC.
+//   - entitlement: the check that an SDDC is entitled to a shard.
 //
 // No VM, zone or dependent resource carries a shard or vCenter label. A VM is
 // associated with an SDDC through its zone label, and dependent resources
-// through their VM.
+// through their VM. While the Supervisor has one SDDC, its shard owns every
+// VM, as a single-vCenter VM Operator does. Once it has several, a VM without
+// a zone belongs to no shard.
 package multivc

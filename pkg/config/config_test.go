@@ -52,12 +52,11 @@ var _ = Describe("Config", func() {
 			Expect(m.HasVCClient()).To(BeFalse())
 			Expect(m.OwnsZone("any")).To(BeTrue())
 		})
-		It("Should own only its zones in a non-primary shard", func() {
+		It("Should own only its zones in a shard when several SDDCs exist", func() {
 			m := pkgcfg.MultiVC{
-				Mode:         pkgcfg.MultiVCModeShard,
-				ShardSDDC:    "sddc-2",
-				OwnedZones:   "zone-2a,zone-2b",
-				ForeignZones: "zone-1",
+				Mode:       pkgcfg.MultiVCModeShard,
+				ShardSDDC:  "sddc-2",
+				OwnedZones: "zone-2a,zone-2b",
 			}
 			Expect(m.RunsWebhooks()).To(BeFalse())
 			Expect(m.HasVCClient()).To(BeTrue())
@@ -65,17 +64,15 @@ var _ = Describe("Config", func() {
 			Expect(m.OwnsZone("zone-1")).To(BeFalse())
 			Expect(m.OwnsZone("unowned")).To(BeFalse())
 		})
-		It("Should own its zones and the unowned zones in the primary shard", func() {
+		It("Should own every zone in the sole shard", func() {
 			m := pkgcfg.MultiVC{
-				Mode:         pkgcfg.MultiVCModeShard,
-				ShardSDDC:    "sddc-1",
-				Primary:      true,
-				OwnedZones:   "zone-1",
-				ForeignZones: "zone-2a,zone-2b",
+				Mode:       pkgcfg.MultiVCModeShard,
+				ShardSDDC:  "sddc-1",
+				Sole:       true,
+				OwnedZones: "zone-1",
 			}
 			Expect(m.OwnsZone("zone-1")).To(BeTrue())
 			Expect(m.OwnsZone("unowned")).To(BeTrue())
-			Expect(m.OwnsZone("zone-2b")).To(BeFalse())
 		})
 	})
 })

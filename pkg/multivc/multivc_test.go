@@ -17,7 +17,9 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 
+	vmopv1 "github.com/vmware-tanzu/vm-operator/api/v1alpha6"
 	topologyv1 "github.com/vmware-tanzu/vm-operator/external/tanzu-topology/api/v1alpha1"
 	pkgcfg "github.com/vmware-tanzu/vm-operator/pkg/config"
 	"github.com/vmware-tanzu/vm-operator/pkg/constants/testlabels"
@@ -95,15 +97,6 @@ var _ = Describe("SDDC", Label(testlabels.API), func() {
 		_, _, err = multivc.SDDC{EndpointURL: "http://10.1.2.10"}.Endpoint()
 		Expect(err).To(HaveOccurred())
 	})
-	It("Should pick the oldest SDDC as primary, breaking ties by name", func() {
-		sddcs := []multivc.SDDC{
-			{Name: "b", CreationTimestamp: metav1.NewTime(now)},
-			{Name: "c", CreationTimestamp: metav1.NewTime(now.Add(time.Minute))},
-			{Name: "a", CreationTimestamp: metav1.NewTime(now)},
-		}
-		Expect(multivc.PrimarySDDC(sddcs)).To(Equal("a"))
-		Expect(multivc.PrimarySDDC(nil)).To(BeEmpty())
-	})
 })
 
 var _ = Describe("Topology and selector", Label(testlabels.API), func() {
@@ -140,8 +133,8 @@ var _ = Describe("Topology and selector", Label(testlabels.API), func() {
 	It("Should resolve each AvailabilityZone to the SDDC that owns it", func() {
 		t, err := multivc.ComputeTopology(sddcs, azs, "vc-2")
 		Expect(err).ToNot(HaveOccurred())
-		Expect(t.Primary).To(Equal("vc-1"))
-		Expect(t.IsPrimary()).To(BeFalse())
+		Expect(t.SDDCs).To(Equal([]string{"vc-1", "vc-2", "vc-3"}))
+		Expect(t.IsSole()).To(BeFalse())
 		Expect(t.Owned).To(Equal([]string{"zone-2"}))
 		Expect(t.Foreign).To(Equal([]string{"zone-1", "zone-3"}))
 		Expect(t.Unowned).To(Equal([]string{"zone-new"}))
@@ -150,18 +143,18 @@ var _ = Describe("Topology and selector", Label(testlabels.API), func() {
 		_, err := multivc.ComputeTopology(sddcs, azs, "vc-9")
 		Expect(err).To(MatchError(multivc.ErrSDDCNotFound))
 	})
-	It("Should give every VM to exactly one shard", func() {
+	It("Should give every VM in an owned zone to exactly one shard, and no shard the rest", func() {
 		shards := []string{"vc-1", "vc-2", "vc-3"}
 		selectors := map[string]labels.Selector{}
 		for _, s := range shards {
 			selectors[s] = selectorFor(s)
 		}
-		for zone, want := range map[string]string{
-			"zone-1":   "vc-1",
-			"zone-2":   "vc-2",
-			"zone-3":   "vc-3",
-			"zone-new": "vc-1",
-			"":         "vc-1",
+		for zone, want := range map[string][]string{
+			"zone-1":   {"vc-1"},
+			"zone-2":   {"vc-2"},
+			"zone-3":   {"vc-3"},
+			"zone-new": nil,
+			"":         nil,
 		} {
 			var got []string
 			for _, s := range shards {
@@ -169,19 +162,33 @@ var _ = Describe("Topology and selector", Label(testlabels.API), func() {
 					got = append(got, s)
 				}
 			}
-			Expect(got).To(Equal([]string{want}), "zone %q", zone)
+			Expect(got).To(Equal(want), "zone %q", zone)
 		}
 	})
-	It("Should select no VM for a non-primary shard that owns no zone", func() {
+	It("Should select no VM for a shard that owns no zone", func() {
 		azs = azs[:1]
 		sel := selectorFor("vc-2")
 		Expect(sel.Matches(vmLabels("zone-1"))).To(BeFalse())
 		Expect(sel.Matches(vmLabels(""))).To(BeFalse())
 	})
-	It("Should select every VM for a primary shard when no zone is foreign", func() {
-		azs = azs[:1]
-		sel := selectorFor("vc-1")
+	It("Should select every VM, with or without a zone, for the sole shard", func() {
+		sddcs = sddcs[:1]
+		t, err := multivc.ComputeTopology(sddcs, azs, "vc-1")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(t.IsSole()).To(BeTrue())
+		m := pkgcfg.MultiVC{Mode: pkgcfg.MultiVCModeShard, ShardSDDC: "vc-1"}
+		t.Apply(&m)
+		Expect(m.Sole).To(BeTrue())
+		sel, err := multivc.VMSelector(m)
+		Expect(err).ToNot(HaveOccurred())
 		Expect(sel.Empty()).To(BeTrue())
+	})
+	It("Should change the fingerprint when a second SDDC joins", func() {
+		before, err := multivc.ComputeTopology(sddcs[:1], azs, "vc-1")
+		Expect(err).ToNot(HaveOccurred())
+		after, err := multivc.ComputeTopology(sddcs[:2], azs, "vc-1")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(after.Fingerprint()).ToNot(Equal(before.Fingerprint()))
 	})
 	It("Should select every VM outside shard mode", func() {
 		sel, err := multivc.VMSelector(pkgcfg.MultiVC{Mode: pkgcfg.MultiVCModeGlobal})
@@ -243,5 +250,78 @@ var _ = Describe("Topology watcher", Label(testlabels.API), func() {
 		cctx, ccancel := context.WithCancel(ctx)
 		ccancel()
 		Expect(multivc.NewTopologyWatcher(client, "vc-2", "", time.Hour, logr.Discard())(cctx)).To(Succeed())
+	})
+})
+
+var _ = Describe("Part", Label(testlabels.API), func() {
+	It("Should run every part in combined mode", func() {
+		for _, p := range []multivc.Part{multivc.PartGlobal, multivc.PartShard, multivc.PartSoleShard} {
+			Expect(multivc.Runs(pkgcfg.MultiVC{}, p)).To(BeTrue())
+		}
+	})
+	It("Should run only the global part in global mode", func() {
+		m := pkgcfg.MultiVC{Mode: pkgcfg.MultiVCModeGlobal}
+		Expect(multivc.Runs(m, multivc.PartGlobal)).To(BeTrue())
+		Expect(multivc.Runs(m, multivc.PartShard)).To(BeFalse())
+		Expect(multivc.Runs(m, multivc.PartSoleShard)).To(BeFalse())
+	})
+	It("Should run the sole-shard part only in a sole shard", func() {
+		m := pkgcfg.MultiVC{Mode: pkgcfg.MultiVCModeShard, ShardSDDC: "s"}
+		Expect(multivc.Runs(m, multivc.PartGlobal)).To(BeFalse())
+		Expect(multivc.Runs(m, multivc.PartShard)).To(BeTrue())
+		Expect(multivc.Runs(m, multivc.PartSoleShard)).To(BeFalse())
+		m.Sole = true
+		Expect(multivc.Runs(m, multivc.PartSoleShard)).To(BeTrue())
+	})
+})
+
+var _ = Describe("Entitlement", Label(testlabels.API), func() {
+	It("Should accept every SDDC with the allow-all verifier", func() {
+		v := multivc.NewAllowAllVerifier(logr.Discard())
+		obj := multivc.NewSDDC()
+		obj.SetName("vc-2")
+		Expect(v.Verify(context.Background(), obj)).To(Succeed())
+		Expect(v.Verify(context.Background(), obj)).To(Succeed())
+	})
+})
+
+var _ = Describe("Dependents", Label(testlabels.API), func() {
+	var (
+		client ctrlclient.Client
+		vm     *vmopv1.VirtualMachine
+	)
+
+	BeforeEach(func() {
+		vm = &vmopv1.VirtualMachine{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "vm-1"}}
+		client = builder.NewFakeClient(vm)
+	})
+
+	admits := func(m pkgcfg.MultiVC, cached ctrlclient.Reader, name string) bool {
+		snap := &vmopv1.VirtualMachineSnapshot{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "snap"}}
+		snap.Spec.VMName = name
+		p := multivc.DependentPredicate(m, cached, client, func(o ctrlclient.Object) string {
+			return o.(*vmopv1.VirtualMachineSnapshot).Spec.VMName
+		})
+		return p.Generic(event.GenericEvent{Object: snap})
+	}
+
+	shard := pkgcfg.MultiVC{Mode: pkgcfg.MultiVCModeShard, ShardSDDC: "vc-2", OwnedZones: "zone-2"}
+	empty := builder.NewFakeClient()
+
+	It("Should admit a dependent whose VM is in the shard's cache", func() {
+		Expect(admits(shard, client, "vm-1")).To(BeTrue())
+	})
+	It("Should not admit a dependent whose VM is another shard's", func() {
+		Expect(admits(shard, empty, "vm-1")).To(BeFalse())
+	})
+	It("Should admit a dependent whose VM does not exist, or that names none", func() {
+		Expect(admits(shard, empty, "vm-gone")).To(BeTrue())
+		Expect(admits(shard, empty, "")).To(BeTrue())
+	})
+	It("Should admit every dependent in the sole shard and outside shard mode", func() {
+		sole := shard
+		sole.Sole = true
+		Expect(admits(sole, empty, "vm-1")).To(BeTrue())
+		Expect(admits(pkgcfg.MultiVC{}, empty, "vm-1")).To(BeTrue())
 	})
 })

@@ -41,8 +41,8 @@ func sddcOwner(refs []metav1.OwnerReference) string {
 
 // Topology is a shard's view of the Supervisor's SDDCs and zones.
 type Topology struct {
-	// Primary is the name of the primary SDDC.
-	Primary string
+	// SDDCs are the names of all SDDCs of the Supervisor, in order.
+	SDDCs []string
 
 	// SDDC is the shard's SDDC.
 	SDDC SDDC
@@ -53,8 +53,9 @@ type Topology struct {
 	// Foreign are the zones whose AvailabilityZone another SDDC owns.
 	Foreign []string
 
-	// Unowned are the zones whose AvailabilityZone no SDDC owns. The primary
-	// shard is responsible for them.
+	// Unowned are the zones whose AvailabilityZone no SDDC owns. A sole
+	// shard is responsible for them. When several SDDCs exist no shard is,
+	// because the zone cannot be resolved to a vCenter.
 	Unowned []string
 }
 
@@ -69,9 +70,9 @@ func ComputeTopology(
 		return Topology{}, err
 	}
 
-	t := Topology{
-		Primary: PrimarySDDC(sddcs),
-		SDDC:    self,
+	t := Topology{SDDC: self}
+	for _, s := range sddcs {
+		t.SDDCs = append(t.SDDCs, s.Name)
 	}
 	for _, az := range azs {
 		switch owner := SDDCOfAvailabilityZone(az); owner {
@@ -107,16 +108,15 @@ func LoadTopology(
 	return ComputeTopology(sddcs, azList.Items, shardSDDC)
 }
 
-// IsPrimary returns true when the shard serves the primary SDDC.
-func (t Topology) IsPrimary() bool {
-	return t.Primary != "" && t.Primary == t.SDDC.Name
+// IsSole returns true when the shard's SDDC is the only SDDC.
+func (t Topology) IsSole() bool {
+	return len(t.SDDCs) == 1
 }
 
 // Apply records the topology in the multi-vCenter configuration.
 func (t Topology) Apply(m *pkgcfg.MultiVC) {
-	m.Primary = t.IsPrimary()
+	m.Sole = t.IsSole()
 	m.OwnedZones = pkgcfg.SliceToString(t.Owned)
-	m.ForeignZones = pkgcfg.SliceToString(t.Foreign)
 }
 
 // Fingerprint returns a string that changes whenever the shard's
@@ -124,7 +124,7 @@ func (t Topology) Apply(m *pkgcfg.MultiVC) {
 // the fingerprint it started with, and restarts when they differ.
 func (t Topology) Fingerprint() string {
 	return strings.Join([]string{
-		"primary=" + t.Primary,
+		"sddcs=" + strings.Join(t.SDDCs, ","),
 		"owned=" + strings.Join(t.Owned, ","),
 		"foreign=" + strings.Join(t.Foreign, ","),
 		"unowned=" + strings.Join(t.Unowned, ","),
