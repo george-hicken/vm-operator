@@ -5,6 +5,7 @@
 package multivc
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"slices"
@@ -69,6 +70,16 @@ func PatchResourcePolicyStatus(
 				latest.Status.ClusterModules = append(latest.Status.ClusterModules, entry)
 			}
 		}
+		// Providers rebuild owned entries by appending them. Keep a canonical
+		// order so alternating shards do not write status just to move entries.
+		slices.SortFunc(latest.Status.ResourcePools, func(a, b vmopv1.ResourcePoolStatus) int {
+			return cmp.Or(cmp.Compare(a.ClusterMoID, b.ClusterMoID),
+				cmp.Compare(a.ChildResourcePoolMoID, b.ChildResourcePoolMoID))
+		})
+		slices.SortFunc(latest.Status.ClusterModules, func(a, b vmopv1.VSphereClusterModuleStatus) int {
+			return cmp.Or(cmp.Compare(a.ClusterMoID, b.ClusterMoID),
+				cmp.Compare(a.GroupName, b.GroupName), cmp.Compare(a.ModuleUuid, b.ModuleUuid))
+		})
 		if apiequality.Semantic.DeepEqual(base.Status, latest.Status) {
 			return nil
 		}
