@@ -80,6 +80,12 @@ func findVMByMoID(
 	// written in another vCenter, the same MoID can name an unrelated VM in
 	// this one. Adopt the VM only when its instance UUID is one this VM can
 	// have, and otherwise fall back to the instance UUID lookup.
+	//
+	// The VM found by the MoID is neither adopted nor changed. A VC VM that no
+	// VirtualMachine resource describes, for example after an etcd restore,
+	// is left alone.
+	// TODO(multi-vCenter): reconcile drift between VC VMs and VirtualMachine
+	// resources after an etcd restore. That is separate work.
 	if vm.Config != nil && !instanceUUIDMatches(vmCtx, vm.Config.InstanceUuid) {
 		vmCtx.Logger.Info("Ignoring VM found via MoID with another instance UUID",
 			"moID", moID, "instanceUUID", vm.Config.InstanceUuid)

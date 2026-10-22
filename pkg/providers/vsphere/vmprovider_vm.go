@@ -23,6 +23,7 @@ import (
 	"github.com/vmware/govmomi/pbm"
 	pbmtypes "github.com/vmware/govmomi/pbm/types"
 	"github.com/vmware/govmomi/property"
+	"github.com/vmware/govmomi/vapi/library"
 	"github.com/vmware/govmomi/vapi/tags"
 	"github.com/vmware/govmomi/vim25/mo"
 	vimtypes "github.com/vmware/govmomi/vim25/types"
@@ -47,6 +48,7 @@ import (
 	ctxop "github.com/vmware-tanzu/vm-operator/pkg/context/operation"
 	pkgerr "github.com/vmware-tanzu/vm-operator/pkg/errors"
 	pkglog "github.com/vmware-tanzu/vm-operator/pkg/log"
+	"github.com/vmware-tanzu/vm-operator/pkg/multivc"
 	"github.com/vmware-tanzu/vm-operator/pkg/providers"
 	vcclient "github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/client"
 	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/clustermodules"
@@ -2436,6 +2438,12 @@ func (vs *vSphereVMProvider) vmCreateGetVirtualMachineImage(
 	case "ClusterContentLibraryItem", "ContentLibraryItem":
 		createArgs.UseContentLibrary = true
 		createArgs.ProviderItemID = imageStatus.ProviderItemID
+		if multivc.NeedsLibraryItemCheck(pkgcfg.FromContext(vmCtx).MultiVC) {
+			if err := vs.vmCreateUseLocalLibraryItem(vmCtx, createArgs); err != nil {
+				pkgcond.MarkError(vmCtx.VM, vmopv1.VirtualMachineConditionImageReady, "NotFoundInVCenter", err)
+				return err
+			}
+		}
 	default:
 		if !SkipVMImageCLProviderCheck {
 			err := fmt.Errorf("unsupported image provider kind: %s", providerRef.Kind)
@@ -2447,6 +2455,50 @@ func (vs *vSphereVMProvider) vmCreateGetVirtualMachineImage(
 		createArgs.ProviderItemID = vmCtx.VM.Spec.Image.Name
 	}
 
+	return nil
+}
+
+// vmCreateUseLocalLibraryItem points the create at the copy of the image's
+// library item in this multi-vCenter shard's vCenter.
+//
+// An image's status names the library item of the vCenter whose shard synced
+// it. When that item is not in this shard's vCenter, the item with the same
+// name is used instead, which is the case when the vCenters' libraries are
+// subscribed to one source. This stands in until an image can reference an
+// item in each vCenter.
+func (vs *vSphereVMProvider) vmCreateUseLocalLibraryItem(
+	vmCtx pkgctx.VirtualMachineContext,
+	createArgs *VMCreateArgs) error {
+
+	c, err := vs.getVcClient(vmCtx)
+	if err != nil {
+		return err
+	}
+	libMgr := library.NewManager(c.RestClient())
+
+	exists, err := multivc.LibraryItemExists(vmCtx, c.RestClient(), createArgs.ProviderItemID)
+	if err != nil || exists {
+		return err
+	}
+
+	name := createArgs.ImageStatus.Name
+	ids, err := libMgr.FindLibraryItems(vmCtx, library.FindItem{Name: name})
+	if err != nil {
+		return fmt.Errorf("failed to find library item %q in this vCenter: %w", name, err)
+	}
+	if len(ids) != 1 {
+		return fmt.Errorf("found %d library items named %q in this vCenter, expected one", len(ids), name)
+	}
+	item, err := libMgr.GetLibraryItem(vmCtx, ids[0])
+	if err != nil {
+		return fmt.Errorf("failed to get library item %q: %w", ids[0], err)
+	}
+
+	vmCtx.Logger.Info("Using this vCenter's library item for the image",
+		"imageItemID", createArgs.ProviderItemID, "localItemID", item.ID, "name", name)
+	createArgs.ProviderItemID = item.ID
+	createArgs.ImageStatus.ProviderItemID = item.ID
+	createArgs.ImageStatus.ProviderContentVersion = item.ContentVersion
 	return nil
 }
 
