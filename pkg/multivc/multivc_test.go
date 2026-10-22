@@ -7,6 +7,7 @@ package multivc_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"time"
@@ -16,10 +17,16 @@ import (
 	. "github.com/onsi/gomega"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	ctrlmgr "sigs.k8s.io/controller-runtime/pkg/manager"
@@ -382,5 +389,142 @@ var _ = Describe("Readiness", Label(testlabels.API), func() {
 		mgr := &readinessManager{registrationError: errors.New("registration failed")}
 		Expect(multivc.AddReadinessCheck(mgr, pkgcfg.MultiVC{Mode: pkgcfg.MultiVCModeShard})).To(
 			MatchError(ContainSubstring("registration failed")))
+	})
+})
+
+var _ = Describe("Resource policy shard status", Label(testlabels.API), func() {
+	var (
+		ctx    context.Context
+		policy *vmopv1.VirtualMachineSetResourcePolicy
+		scheme *runtime.Scheme
+	)
+	shardContext := func(sddc string) context.Context {
+		return pkgcfg.UpdateContext(pkgcfg.NewContext(), func(config *pkgcfg.Config) {
+			config.MultiVC = pkgcfg.MultiVC{Mode: pkgcfg.MultiVCModeShard, ShardSDDC: sddc}
+		})
+	}
+	setEntries := func(policy *vmopv1.VirtualMachineSetResourcePolicy, sddc, uuid string) {
+		policy.Status.ResourcePools = append(policy.Status.ResourcePools, vmopv1.ResourcePoolStatus{
+			ClusterMoID: sddc + "/domain-c1", ChildResourcePoolMoID: "resgroup-" + sddc,
+		})
+		policy.Status.ClusterModules = append(policy.Status.ClusterModules, vmopv1.VSphereClusterModuleStatus{
+			ClusterMoID: sddc + "/domain-c1", GroupName: "cp", ModuleUuid: uuid,
+		})
+	}
+	BeforeEach(func() {
+		ctx = shardContext("vc-2")
+		scheme = runtime.NewScheme()
+		Expect(vmopv1.AddToScheme(scheme)).To(Succeed())
+		policy = &vmopv1.VirtualMachineSetResourcePolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: "policy", Namespace: "ns", UID: types.UID("policy-uid")},
+		}
+	})
+
+	It("Should preserve all writers when stale shards create entries and a status patch conflicts", func() {
+		patches := 0
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(policy).
+			WithStatusSubresource(policy).
+			WithInterceptorFuncs(interceptor.Funcs{
+				SubResourcePatch: func(ctx context.Context, c ctrlclient.Client, subresource string,
+					obj ctrlclient.Object, patch ctrlclient.Patch, opts ...ctrlclient.SubResourcePatchOption) error {
+					patches++
+					if patches == 2 {
+						latest := &vmopv1.VirtualMachineSetResourcePolicy{}
+						Expect(c.Get(ctx, ctrlclient.ObjectKeyFromObject(obj), latest)).To(Succeed())
+						setEntries(latest, "vc-3", "module-vc3")
+						Expect(c.Status().Update(ctx, latest)).To(Succeed())
+					}
+					return c.SubResource(subresource).Patch(ctx, obj, patch, opts...)
+				},
+			}).Build()
+		before := policy.DeepCopy()
+		Expect(c.Get(ctx, ctrlclient.ObjectKeyFromObject(policy), before)).To(Succeed())
+		first, second := before.DeepCopy(), before.DeepCopy()
+		setEntries(first, "vc-1", "module-vc1")
+		setEntries(second, "vc-2", "already-created-module-vc2")
+		Expect(multivc.PatchResourcePolicyStatus(shardContext("vc-1"), c, c, before, first)).To(Succeed())
+		Expect(multivc.PatchResourcePolicyStatus(ctx, c, c, before, second)).To(Succeed())
+		latest := &vmopv1.VirtualMachineSetResourcePolicy{}
+		Expect(c.Get(ctx, ctrlclient.ObjectKeyFromObject(policy), latest)).To(Succeed())
+		Expect(patches).To(Equal(3))
+		Expect(latest.Status.ResourcePools).To(HaveLen(3))
+		Expect(latest.Status.ClusterModules).To(ConsistOf(
+			first.Status.ClusterModules[0], second.Status.ClusterModules[0],
+			vmopv1.VSphereClusterModuleStatus{ClusterMoID: "vc-3/domain-c1", GroupName: "cp", ModuleUuid: "module-vc3"},
+		))
+		Expect(second.Status.ClusterModules[0].ModuleUuid).To(Equal("already-created-module-vc2"))
+	})
+
+	It("Should remove only the deleting shard's entries and preserve newer foreign entries", func() {
+		setEntries(policy, "vc-1", "old-module-vc1")
+		setEntries(policy, "vc-2", "module-vc2")
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(policy).WithStatusSubresource(policy).Build()
+		before := policy.DeepCopy()
+		Expect(c.Get(ctx, ctrlclient.ObjectKeyFromObject(policy), before)).To(Succeed())
+		after := before.DeepCopy()
+		after.Status.ResourcePools = after.Status.ResourcePools[:1]
+		after.Status.ClusterModules = after.Status.ClusterModules[:1]
+		fresh := before.DeepCopy()
+		fresh.Status.ClusterModules[0].ModuleUuid = "new-module-vc1"
+		Expect(c.Status().Update(ctx, fresh)).To(Succeed())
+		Expect(multivc.PatchResourcePolicyStatus(ctx, c, c, before, after)).To(Succeed())
+		Expect(c.Get(ctx, ctrlclient.ObjectKeyFromObject(policy), fresh)).To(Succeed())
+		Expect(fresh.Status.ResourcePools).To(ConsistOf(before.Status.ResourcePools[0]))
+		Expect(fresh.Status.ClusterModules).To(ConsistOf(vmopv1.VSphereClusterModuleStatus{
+			ClusterMoID: "vc-1/domain-c1", GroupName: "cp", ModuleUuid: "new-module-vc1",
+		}))
+	})
+
+	It("Should replace a claimed legacy entry while retaining other legacy entries", func() {
+		claimed := vmopv1.VSphereClusterModuleStatus{GroupName: "cp", ModuleUuid: "claimed"}
+		foreign := vmopv1.VSphereClusterModuleStatus{GroupName: "cp", ModuleUuid: "foreign"}
+		policy.Status.ClusterModules = []vmopv1.VSphereClusterModuleStatus{claimed, foreign}
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(policy).WithStatusSubresource(policy).Build()
+		before := policy.DeepCopy()
+		Expect(c.Get(ctx, ctrlclient.ObjectKeyFromObject(policy), before)).To(Succeed())
+		after := before.DeepCopy()
+		after.Status.ClusterModules[0].ClusterMoID = "vc-2/domain-c1"
+		Expect(multivc.PatchResourcePolicyStatus(ctx, c, c, before, after)).To(Succeed())
+		Expect(c.Get(ctx, ctrlclient.ObjectKeyFromObject(policy), policy)).To(Succeed())
+		Expect(policy.Status.ClusterModules).To(ConsistOf(after.Status.ClusterModules))
+	})
+
+	It("Should skip an unchanged status", func() {
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(policy).
+			WithInterceptorFuncs(interceptor.Funcs{
+				Get: func(context.Context, ctrlclient.WithWatch, ctrlclient.ObjectKey, ctrlclient.Object, ...ctrlclient.GetOption) error {
+					return fmt.Errorf("unexpected read")
+				},
+			}).Build()
+		Expect(multivc.PatchResourcePolicyStatus(ctx, c, c, policy, policy.DeepCopy())).To(Succeed())
+	})
+
+	It("Should report exhausted conflicts without changing the intended module UUID", func() {
+		patches := 0
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(policy).WithStatusSubresource(policy).
+			WithInterceptorFuncs(interceptor.Funcs{
+				SubResourcePatch: func(context.Context, ctrlclient.Client, string, ctrlclient.Object,
+					ctrlclient.Patch, ...ctrlclient.SubResourcePatchOption) error {
+					patches++
+					return apierrors.NewConflict(schema.GroupResource{Resource: "virtualmachinesetresourcepolicies"}, policy.Name, fmt.Errorf("concurrent write"))
+				},
+			}).Build()
+		before := policy.DeepCopy()
+		Expect(c.Get(ctx, ctrlclient.ObjectKeyFromObject(policy), before)).To(Succeed())
+		after := before.DeepCopy()
+		setEntries(after, "vc-2", "created-once")
+		err := multivc.PatchResourcePolicyStatus(ctx, c, c, before, after)
+		Expect(apierrors.IsConflict(err)).To(BeTrue())
+		Expect(patches).To(BeNumerically(">", 1))
+		Expect(after.Status.ClusterModules[0].ModuleUuid).To(Equal("created-once"))
+	})
+
+	It("Should reject a policy that was replaced while reconciling", func() {
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(policy).WithStatusSubresource(policy).Build()
+		before := policy.DeepCopy()
+		before.UID = "old-policy-uid"
+		after := before.DeepCopy()
+		setEntries(after, "vc-2", "created-once")
+		Expect(multivc.PatchResourcePolicyStatus(ctx, c, c, before, after)).To(MatchError(ContainSubstring("was replaced")))
 	})
 })
