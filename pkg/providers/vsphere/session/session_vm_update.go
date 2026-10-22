@@ -33,6 +33,7 @@ import (
 	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/network"
 	res "github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/resources"
 	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/virtualmachine"
+	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/vmidentity"
 	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/vmlifecycle"
 	pkgutil "github.com/vmware-tanzu/vm-operator/pkg/util"
 	netsetutil "github.com/vmware-tanzu/vm-operator/pkg/util/kube/networksettings"
@@ -604,6 +605,11 @@ func UpdateConfigSpecExtraConfig(
 				}
 			}
 		}
+	}
+
+	maps.Copy(extraConfig, vmidentity.FromContext(ctx).ExtraConfig())
+	if vm != nil && vm.Name != "" && vm.Namespace != "" {
+		extraConfig[constants.ExtraConfigVMServiceNamespacedName] = vm.NamespacedName()
 	}
 
 	// Update the ConfigSpec's ExtraConfig property with the results from

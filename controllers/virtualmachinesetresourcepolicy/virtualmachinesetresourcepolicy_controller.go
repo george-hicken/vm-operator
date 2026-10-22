@@ -6,11 +6,13 @@ package virtualmachinesetresourcepolicy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
 
 	"github.com/go-logr/logr"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -24,6 +26,7 @@ import (
 	pkgcfg "github.com/vmware-tanzu/vm-operator/pkg/config"
 	pkgctx "github.com/vmware-tanzu/vm-operator/pkg/context"
 	pkglog "github.com/vmware-tanzu/vm-operator/pkg/log"
+	"github.com/vmware-tanzu/vm-operator/pkg/multivc"
 	"github.com/vmware-tanzu/vm-operator/pkg/patch"
 	"github.com/vmware-tanzu/vm-operator/pkg/providers"
 )
@@ -32,6 +35,10 @@ const (
 	finalizerName           = "vmoperator.vmware.com/virtualmachinesetresourcepolicy"
 	deprecatedFinalizerName = "virtualmachinesetresourcepolicy.vmoperator.vmware.com"
 )
+
+// ErrShardPolicyDeletionUnsupported means shard cleanup cannot yet prove every
+// historical SDDC obligation and must leave the shared deletion gate intact.
+var ErrShardPolicyDeletionUnsupported = errors.New("resource policy deletion is unsupported in shard mode")
 
 // AddToManager adds this package's controller to the provided manager.
 func AddToManager(ctx *pkgctx.ControllerManagerContext, mgr manager.Manager) error {
@@ -48,6 +55,8 @@ func AddToManager(ctx *pkgctx.ControllerManagerContext, mgr manager.Manager) err
 		ctrl.Log.WithName("controllers").WithName(controlledTypeName),
 		ctx.VMProvider,
 	)
+
+	r.APIReader = mgr.GetAPIReader()
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(controlledType).
@@ -69,6 +78,7 @@ func NewReconciler(
 	return &Reconciler{
 		Context:    ctx,
 		Client:     client,
+		APIReader:  client,
 		Logger:     logger,
 		VMProvider: vmProvider,
 	}
@@ -97,7 +107,9 @@ func zoneToNamespaceVMSRP(
 
 // Reconciler reconciles a VirtualMachineSetResourcePolicy object.
 type Reconciler struct {
-	Context context.Context
+	// APIReader bypasses the cache when retrying a shared status write.
+	APIReader client.Reader
+	Context   context.Context
 	client.Client
 	Logger     logr.Logger
 	VMProvider providers.VirtualMachineProviderInterface
@@ -105,6 +117,28 @@ type Reconciler struct {
 
 // ReconcileNormal reconciles a VirtualMachineSetResourcePolicy.
 func (r *Reconciler) ReconcileNormal(ctx *pkgctx.VirtualMachineSetResourcePolicyContext) error {
+	if pkgcfg.FromContext(ctx).MultiVC.IsShard() {
+		// Reconcile registers the gate first. Check the live object as well,
+		// since this method is also callable directly by tests and callers.
+		reader := r.APIReader
+		if reader == nil {
+			reader = r.Client
+		}
+		live := &vmopv1.VirtualMachineSetResourcePolicy{}
+		if err := reader.Get(ctx, client.ObjectKeyFromObject(ctx.ResourcePolicy), live); err != nil {
+			return err
+		}
+		if live.UID != ctx.ResourcePolicy.UID {
+			return fmt.Errorf("resource policy was replaced before shard provider reconciliation")
+		}
+		if !live.DeletionTimestamp.IsZero() {
+			return r.ReconcileDelete(ctx)
+		}
+		if !controllerutil.ContainsFinalizer(live, finalizerName) {
+			return fmt.Errorf("resource policy %s has no persisted deletion gate", client.ObjectKeyFromObject(live))
+		}
+		return r.VMProvider.CreateOrUpdateVirtualMachineSetResourcePolicy(ctx, ctx.ResourcePolicy)
+	}
 	if !controllerutil.ContainsFinalizer(ctx.ResourcePolicy, finalizerName) {
 		// If the object has the deprecated finalizer, remove it.
 		if updated := controllerutil.RemoveFinalizer(ctx.ResourcePolicy, deprecatedFinalizerName); updated {
@@ -159,6 +193,14 @@ func (r *Reconciler) deleteResourcePolicy(ctx *pkgctx.VirtualMachineSetResourceP
 }
 
 func (r *Reconciler) ReconcileDelete(ctx *pkgctx.VirtualMachineSetResourcePolicyContext) error {
+	if pkgcfg.FromContext(ctx).MultiVC.IsShard() {
+		// The shared gate covers historical resources in every SDDC. A
+		// shard cannot prove their full cleanup from current topology or
+		// status, so automatic shard deletion remains unsupported.
+		return fmt.Errorf("%w for %s uid %s: historical SDDC cleanup obligations need review",
+			ErrShardPolicyDeletionUnsupported,
+			client.ObjectKeyFromObject(ctx.ResourcePolicy), ctx.ResourcePolicy.UID)
+	}
 	ctx.Logger.Info("Reconciling VirtualMachineSetResourcePolicy Deletion")
 	defer func() {
 		ctx.Logger.Info("Finished Reconciling VirtualMachineSetResourcePolicy Deletion")
@@ -177,15 +219,59 @@ func (r *Reconciler) ReconcileDelete(ctx *pkgctx.VirtualMachineSetResourcePolicy
 	return nil
 }
 
+// ensureSharedFinalizer persists the deletion gate before a shard creates
+// resources in vCenter. It uses a fresh API read and an optimistic patch so
+// concurrent metadata writers cannot lose each other's finalizers.
+func (r *Reconciler) ensureSharedFinalizer(
+	ctx context.Context,
+	observed *vmopv1.VirtualMachineSetResourcePolicy) (*vmopv1.VirtualMachineSetResourcePolicy, error) {
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+	key := client.ObjectKeyFromObject(observed)
+	var latest *vmopv1.VirtualMachineSetResourcePolicy
+	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		latest = &vmopv1.VirtualMachineSetResourcePolicy{}
+		if err := reader.Get(ctx, key, latest); err != nil {
+			return err
+		}
+		if latest.UID != observed.UID {
+			return fmt.Errorf("resource policy %s was replaced while adding its deletion gate", key)
+		}
+		if !latest.DeletionTimestamp.IsZero() || controllerutil.ContainsFinalizer(latest, finalizerName) {
+			return nil
+		}
+		base := latest.DeepCopy()
+		controllerutil.AddFinalizer(latest, finalizerName)
+		return r.Client.Patch(ctx, latest, client.MergeFromWithOptions(
+			base, client.MergeFromWithOptimisticLock{}))
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to persist resource policy deletion gate: %w", err)
+	}
+	return latest, nil
+}
+
 // +kubebuilder:rbac:groups=vmoperator.vmware.com,resources=virtualmachinesetresourcepolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=vmoperator.vmware.com,resources=virtualmachinesetresourcepolicies/status,verbs=get;update;patch
 
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Result, reterr error) {
 	ctx = pkgcfg.JoinContext(ctx, r.Context)
+	shardMode := pkgcfg.FromContext(ctx).MultiVC.IsShard()
 
 	rp := &vmopv1.VirtualMachineSetResourcePolicy{}
 	if err := r.Get(ctx, req.NamespacedName, rp); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	if shardMode && rp.DeletionTimestamp.IsZero() {
+		// Persist the gate and then observe deletion again on the fresh object.
+		// The provider must never run on a pre-registration snapshot.
+		var err error
+		rp, err = r.ensureSharedFinalizer(ctx, rp)
+		if err != nil {
+			return ctrl.Result{}, client.IgnoreNotFound(err)
+		}
 	}
 
 	rpCtx := &pkgctx.VirtualMachineSetResourcePolicyContext{
@@ -193,13 +279,39 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Re
 		Logger:         pkglog.FromContextOrDefault(ctx),
 		ResourcePolicy: rp,
 	}
+	if shardMode && !rp.DeletionTimestamp.IsZero() {
+		return ctrl.Result{}, r.ReconcileDelete(rpCtx)
+	}
 
+	before := rp.DeepCopy()
 	patchHelper, err := patch.NewHelper(rp, r.Client)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to init patch helper for %s: %w", rpCtx, err)
 	}
 	defer func() {
-		if err := patchHelper.Patch(ctx, rp); err != nil {
+		patchObject := rp
+		if shardMode {
+			reader := r.APIReader
+			if reader == nil {
+				reader = r.Client
+			}
+			if err := multivc.PatchResourcePolicyStatus(ctx, r.Client, reader, before, rp); err != nil {
+				if reterr == nil {
+					reterr = err
+				}
+				rpCtx.Logger.Error(err, "shard status patch failed")
+				// Leave the shared deletion gate intact on persistence failure.
+				return
+			}
+			// The lists have already been merged under optimistic locking.
+			// Leave only metadata/spec changes for the ordinary patch helper.
+			patchObject = rp.DeepCopy()
+			patchObject.Status = before.Status
+			// The optimistic gate patch owns the finalizer list. A stale
+			// deferred patch must not restore or drop a concurrent gate.
+			patchObject.Finalizers = before.Finalizers
+		}
+		if err := patchHelper.Patch(ctx, patchObject); err != nil {
 			if reterr == nil {
 				reterr = err
 			}

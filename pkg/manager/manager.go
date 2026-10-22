@@ -40,8 +40,10 @@ import (
 	vspherepolv1 "github.com/vmware-tanzu/vm-operator/external/vsphere-policy/api/v1alpha1"
 
 	vmopapi "github.com/vmware-tanzu/vm-operator/api"
+	vmopv1 "github.com/vmware-tanzu/vm-operator/api/v1alpha6"
 	pkgcfg "github.com/vmware-tanzu/vm-operator/pkg/config"
 	pkgctx "github.com/vmware-tanzu/vm-operator/pkg/context"
+	"github.com/vmware-tanzu/vm-operator/pkg/multivc"
 	"github.com/vmware-tanzu/vm-operator/pkg/record"
 )
 
@@ -96,6 +98,31 @@ func New(ctx context.Context, opts Options) (Manager, error) {
 		_ = vpcv1alpha1.AddToScheme(opts.Scheme)
 	}
 
+	// A multi-vCenter shard caches only the VMs in its zones. Everything that
+	// reads VMs through the manager's client, controllers included, sees only
+	// those VMs.
+	vmSelector, err := multivc.VMSelector(pkgcfg.FromContext(ctx).MultiVC)
+	if err != nil {
+		return nil, err
+	}
+	var byObject map[client.Object]cache.ByObject
+	if !vmSelector.Empty() {
+		byObject = map[client.Object]cache.ByObject{
+			&vmopv1.VirtualMachine{}: {Label: vmSelector},
+		}
+	}
+	if pkgcfg.FromContext(ctx).MultiVC.IsGlobal() {
+		if byObject == nil {
+			byObject = make(map[client.Object]cache.ByObject)
+		}
+		// The shard controller watches Deployments in the pod namespace.
+		// Scope its informer before LIST/WATCH, since the global process has
+		// only namespace-scoped Deployment permissions.
+		byObject[&appsv1.Deployment{}] = cache.ByObject{
+			Namespaces: GetNamespaceCacheConfigs(opts.PodNamespace),
+		}
+	}
+
 	// Build the controller manager.
 	mgr, err := ctrlmgr.New(opts.KubeConfig, ctrlmgr.Options{
 		Scheme: opts.Scheme,
@@ -103,6 +130,7 @@ func New(ctx context.Context, opts Options) (Manager, error) {
 			DefaultNamespaces: GetNamespaceCacheConfigs(opts.WatchNamespace),
 			DefaultTransform:  cache.TransformStripManagedFields(),
 			SyncPeriod:        &opts.SyncPeriod,
+			ByObject:          byObject,
 		},
 		Client: client.Options{
 			Cache: &client.CacheOptions{
@@ -119,9 +147,8 @@ func New(ctx context.Context, opts Options) (Manager, error) {
 					// in order to patch it to restart the pods in the
 					// deployment when capabilities have changed.
 					// Capabilities do not change often enough to warrant
-					// caching the Deployment resource, and thus there is no
-					// reason to cache Deployment resources as nothing else in
-					// VM Operator gets them.
+					// caching Deployment reads. The shard controller's explicit
+					// watch still creates an informer, scoped above in global mode.
 					&appsv1.Deployment{},
 				},
 			},

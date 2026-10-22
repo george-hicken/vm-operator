@@ -35,6 +35,7 @@ import (
 	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/network"
 	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/session"
 	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/virtualmachine"
+	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/vmidentity"
 	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/vmlifecycle"
 	pkgutil "github.com/vmware-tanzu/vm-operator/pkg/util"
 	"github.com/vmware-tanzu/vm-operator/pkg/util/ptr"
@@ -130,6 +131,30 @@ var _ = Describe("Update ConfigSpec", func() {
 		Context("Empty input", func() {
 			Specify("no changes", func() {
 				Expect(ecMap).To(BeEmpty())
+			})
+		})
+
+		When("the context carries a VM identity", func() {
+			BeforeEach(func() {
+				ctx = vmidentity.WithContext(ctx, vmidentity.Identity{SupervisorID: "sv-1"})
+				config.ExtraConfig = append(config.ExtraConfig, &vimtypes.OptionValue{
+					Key: vmidentity.ExtraConfigNamespaceOrgID, Value: "org-1"})
+			})
+			Specify("stamps the Supervisor ID and leaves an unset org ID alone", func() {
+				Expect(ecMap).To(Equal(map[string]string{vmidentity.ExtraConfigSupervisorID: "sv-1"}))
+			})
+		})
+
+		When("the VM has a namespace and name", func() {
+			BeforeEach(func() {
+				vm.Namespace = "workload"
+				vm.Name = "example"
+				ctx = vmidentity.WithContext(ctx, vmidentity.Identity{SupervisorID: "sv-1"})
+			})
+			Specify("retains the namespace/name beside the Supervisor stamp in the final update", func() {
+				Expect(ecMap).To(HaveKeyWithValue(constants.ExtraConfigVMServiceNamespacedName,
+					"workload/example"))
+				Expect(ecMap).To(HaveKeyWithValue(vmidentity.ExtraConfigSupervisorID, "sv-1"))
 			})
 		})
 

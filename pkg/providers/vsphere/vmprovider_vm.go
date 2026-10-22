@@ -23,6 +23,7 @@ import (
 	"github.com/vmware/govmomi/pbm"
 	pbmtypes "github.com/vmware/govmomi/pbm/types"
 	"github.com/vmware/govmomi/property"
+	"github.com/vmware/govmomi/vapi/library"
 	"github.com/vmware/govmomi/vapi/tags"
 	"github.com/vmware/govmomi/vim25/mo"
 	vimtypes "github.com/vmware/govmomi/vim25/types"
@@ -47,6 +48,7 @@ import (
 	ctxop "github.com/vmware-tanzu/vm-operator/pkg/context/operation"
 	pkgerr "github.com/vmware-tanzu/vm-operator/pkg/errors"
 	pkglog "github.com/vmware-tanzu/vm-operator/pkg/log"
+	"github.com/vmware-tanzu/vm-operator/pkg/multivc"
 	"github.com/vmware-tanzu/vm-operator/pkg/providers"
 	vcclient "github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/client"
 	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/clustermodules"
@@ -59,6 +61,7 @@ import (
 	upgradevm "github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/upgrade/virtualmachine"
 	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/vcenter"
 	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/virtualmachine"
+	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/vmidentity"
 	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/vmlifecycle"
 	"github.com/vmware-tanzu/vm-operator/pkg/topology"
 	pkgutil "github.com/vmware-tanzu/vm-operator/pkg/util"
@@ -124,6 +127,10 @@ type vmUpdateArgs = session.VMUpdateArgs
 type vmResizeArgs = session.VMResizeArgs
 
 var (
+	// ErrShardCleanupUnsupported prevents partial ownership release until the
+	// shard has a durable cleanup protocol that survives retries and crashes.
+	ErrShardCleanupUnsupported = errors.New("unregistering a VM in shard mode is unsupported")
+
 	createCountLock       sync.Mutex
 	concurrentCreateCount int
 
@@ -196,6 +203,20 @@ func (vs *vSphereVMProvider) createOrUpdateVirtualMachine(
 	if err != nil {
 		return nil, err
 	}
+
+	id, err := vs.getVMIdentity(ctx, vm)
+	if err != nil {
+		return nil, err
+	}
+	ctx = vmidentity.WithContext(ctx, id)
+	if vm.DeletionTimestamp.IsZero() {
+		if _, imported := vm.Annotations[vmopv1.ImportedVMAnnotation]; imported {
+			ctx = vmidentity.WithAdoption(ctx)
+		} else if _, restored := vm.Annotations[vmopv1.RestoredVMAnnotation]; restored {
+			ctx = vmidentity.WithAdoption(ctx)
+		}
+	}
+	vmCtx.Context = ctx
 
 	// Set the VC UUID annotation on the VM before attempting creation or
 	// update. Among other things, the annotation facilitates differential
@@ -327,6 +348,9 @@ func (vs *vSphereVMProvider) createOrUpdateVirtualMachine(
 func (vs *vSphereVMProvider) CleanupVirtualMachine(
 	ctx context.Context,
 	vm *vmopv1.VirtualMachine) error {
+	if pkgcfg.FromContext(ctx).MultiVC.IsShard() {
+		return ErrShardCleanupUnsupported
+	}
 
 	vmNamespacedName := vm.NamespacedName()
 
@@ -2436,6 +2460,12 @@ func (vs *vSphereVMProvider) vmCreateGetVirtualMachineImage(
 	case "ClusterContentLibraryItem", "ContentLibraryItem":
 		createArgs.UseContentLibrary = true
 		createArgs.ProviderItemID = imageStatus.ProviderItemID
+		if multivc.NeedsLibraryItemCheck(pkgcfg.FromContext(vmCtx).MultiVC) {
+			if err := vs.vmCreateUseLocalLibraryItem(vmCtx, createArgs); err != nil {
+				pkgcond.MarkError(vmCtx.VM, vmopv1.VirtualMachineConditionImageReady, "NotFoundInVCenter", err)
+				return err
+			}
+		}
 	default:
 		if !SkipVMImageCLProviderCheck {
 			err := fmt.Errorf("unsupported image provider kind: %s", providerRef.Kind)
@@ -2447,6 +2477,50 @@ func (vs *vSphereVMProvider) vmCreateGetVirtualMachineImage(
 		createArgs.ProviderItemID = vmCtx.VM.Spec.Image.Name
 	}
 
+	return nil
+}
+
+// vmCreateUseLocalLibraryItem points the create at the copy of the image's
+// library item in this multi-vCenter shard's vCenter.
+//
+// An image's status names the library item of the vCenter whose shard synced
+// it. When that item is not in this shard's vCenter, the item with the same
+// name is used instead, which is the case when the vCenters' libraries are
+// subscribed to one source. This stands in until an image can reference an
+// item in each vCenter.
+func (vs *vSphereVMProvider) vmCreateUseLocalLibraryItem(
+	vmCtx pkgctx.VirtualMachineContext,
+	createArgs *VMCreateArgs) error {
+
+	c, err := vs.getVcClient(vmCtx)
+	if err != nil {
+		return err
+	}
+	libMgr := library.NewManager(c.RestClient())
+
+	exists, err := multivc.LibraryItemExists(vmCtx, c.RestClient(), createArgs.ProviderItemID)
+	if err != nil || exists {
+		return err
+	}
+
+	name := createArgs.ImageStatus.Name
+	ids, err := libMgr.FindLibraryItems(vmCtx, library.FindItem{Name: name})
+	if err != nil {
+		return fmt.Errorf("failed to find library item %q in this vCenter: %w", name, err)
+	}
+	if len(ids) != 1 {
+		return fmt.Errorf("found %d library items named %q in this vCenter, expected one", len(ids), name)
+	}
+	item, err := libMgr.GetLibraryItem(vmCtx, ids[0])
+	if err != nil {
+		return fmt.Errorf("failed to get library item %q: %w", ids[0], err)
+	}
+
+	vmCtx.Logger.Info("Using this vCenter's library item for the image",
+		"imageItemID", createArgs.ProviderItemID, "localItemID", item.ID, "name", name)
+	createArgs.ProviderItemID = item.ID
+	createArgs.ImageStatus.ProviderItemID = item.ID
+	createArgs.ImageStatus.ProviderContentVersion = item.ContentVersion
 	return nil
 }
 
@@ -3410,4 +3484,32 @@ func (vs *vSphereVMProvider) vmResizeGetArgs(
 	}
 
 	return resizeArgs, nil
+}
+
+// getVMIdentity returns the identity to stamp on the VM's VC VM. The
+// Supervisor ID is cached once it is found.
+func (vs *vSphereVMProvider) getVMIdentity(
+	ctx context.Context,
+	vm *vmopv1.VirtualMachine) (vmidentity.Identity, error) {
+
+	var id vmidentity.Identity
+	if p := vs.supervisorID.Load(); p != nil {
+		id.SupervisorID = *p
+	} else {
+		sid, err := vmidentity.GetSupervisorID(ctx, vs.k8sClient)
+		if err != nil {
+			return id, err
+		}
+		if sid != "" {
+			vs.supervisorID.Store(&sid)
+		}
+		id.SupervisorID = sid
+	}
+
+	orgID, err := vmidentity.GetNamespaceOrgID(ctx, vs.k8sClient, vm.Namespace)
+	if err != nil {
+		return id, err
+	}
+	id.OrgID = orgID
+	return id, nil
 }

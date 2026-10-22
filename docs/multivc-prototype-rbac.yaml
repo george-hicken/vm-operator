@@ -1,0 +1,89 @@
+# RBAC that the multi-vCenter prototype adds to a VM Operator deployment.
+#
+# The global process (VMOP_MULTIVC_MODE=global) renders one shard Deployment
+# and one credential SecretTemplate per SDDC in its own namespace, and reads
+# SDDCs. The shards run as the same service account and read their SDDC.
+# Its Deployment informer watches only the VM Operator pod namespace, so this
+# namespaced Role covers both the shard controller's watch and its writes.
+#
+# Append these documents to vmop.yaml. The namespace and service account are
+# those of the Supervisor's vmop.yaml.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: vmware-system-vmop-multivc-sddc-reader
+rules:
+- apiGroups:
+  - iaas.vmware.com
+  resources:
+  - sddcs
+  verbs:
+  - get
+  - list
+  - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: vmware-system-vmop-multivc-sddc-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: vmware-system-vmop-multivc-sddc-reader
+subjects:
+- kind: ServiceAccount
+  name: vmware-system-vmop-vmoperator-service-account
+  namespace: vmware-system-vmop
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vmware-system-vmop-multivc-shards
+  namespace: vmware-system-vmop
+rules:
+- apiGroups:
+  - apps
+  resources:
+  - deployments
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+  - delete
+- apiGroups:
+  - secretgen.carvel.dev
+  resources:
+  - secrettemplates
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+  - delete
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - get
+  - list
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: vmware-system-vmop-multivc-shards
+  namespace: vmware-system-vmop
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: vmware-system-vmop-multivc-shards
+subjects:
+- kind: ServiceAccount
+  name: vmware-system-vmop-vmoperator-service-account
+  namespace: vmware-system-vmop

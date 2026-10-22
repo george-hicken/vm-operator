@@ -147,6 +147,16 @@ func (r *ReconcilerV1A2) Reconcile(
 	}
 	logger = logger.WithValues("vmiName", vmiName)
 
+	if obj.GetDeletionTimestamp().IsZero() {
+		skip, err := skipLibraryItem(ctx, r.VMProvider, spec.ID)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if skip {
+			return ctrl.Result{}, nil
+		}
+	}
+
 	patchHelper, err := patch.NewHelper(obj, r.Client)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf(

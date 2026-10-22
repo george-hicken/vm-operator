@@ -51,6 +51,8 @@ const (
 	WebhookSecretName
 	WebhookSecretNamespace
 	CRDCleanupEnabled
+	MultiVCMode
+	MultiVCShardSDDC
 	FSSInstanceStorage
 	FSSPodVMOnStretchedSupervisor
 	FSSVMResizeCPUMemory
@@ -165,6 +167,10 @@ func (n VarName) String() string {
 		return "WEBHOOK_SECRET_NAMESPACE"
 	case CRDCleanupEnabled:
 		return "CRD_CLEANUP_ENABLED"
+	case MultiVCMode:
+		return "VMOP_MULTIVC_MODE"
+	case MultiVCShardSDDC:
+		return "VMOP_SHARD_SDDC"
 
 	//
 	// Features/Capabilities

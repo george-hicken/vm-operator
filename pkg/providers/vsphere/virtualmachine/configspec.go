@@ -11,6 +11,7 @@ import (
 	pkgcfg "github.com/vmware-tanzu/vm-operator/pkg/config"
 	pkgctx "github.com/vmware-tanzu/vm-operator/pkg/context"
 	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/constants"
+	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/vmidentity"
 	"github.com/vmware-tanzu/vm-operator/pkg/util"
 	kubeutil "github.com/vmware-tanzu/vm-operator/pkg/util/kube"
 	"github.com/vmware-tanzu/vm-operator/pkg/util/ptr"
@@ -56,6 +57,11 @@ func CreateConfigSpec(
 			Key:   constants.ExtraConfigVMServiceNamespacedName,
 			Value: vmCtx.VM.NamespacedName(),
 		},
+	)
+
+	// Stamp the Supervisor and namespace organization that own the VM.
+	configSpec.ExtraConfig = util.OptionValues(configSpec.ExtraConfig).Merge(
+		util.OptionValuesFromMap(vmidentity.FromContext(vmCtx).ExtraConfig())...,
 	)
 
 	// Ensure ExtraConfig contains the VM Class's reservation profile ID if set.

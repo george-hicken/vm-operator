@@ -22,6 +22,8 @@ import (
 	pkgctx "github.com/vmware-tanzu/vm-operator/pkg/context"
 	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/constants"
 	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/virtualmachine"
+	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/vmidentity"
+	"github.com/vmware-tanzu/vm-operator/pkg/util"
 	kubeutil "github.com/vmware-tanzu/vm-operator/pkg/util/kube"
 	"github.com/vmware-tanzu/vm-operator/pkg/util/ptr"
 	"github.com/vmware-tanzu/vm-operator/test/builder"
@@ -82,6 +84,20 @@ var _ = Describe("CreateConfigSpec", func() {
 			vmImageStatus,
 			minCPUFreq)
 		Expect(configSpec).ToNot(BeNil())
+	})
+
+	When("the context carries a VM identity", func() {
+		BeforeEach(func() {
+			classConfigSpec = vimtypes.VirtualMachineConfigSpec{}
+			vmCtx.Context = vmidentity.WithContext(vmCtx.Context,
+				vmidentity.Identity{SupervisorID: "sv-1", OrgID: "org-1"})
+		})
+
+		It("stamps the Supervisor and organization IDs", func() {
+			ec := util.OptionValues(configSpec.ExtraConfig).StringMap()
+			Expect(ec).To(HaveKeyWithValue(vmidentity.ExtraConfigSupervisorID, "sv-1"))
+			Expect(ec).To(HaveKeyWithValue(vmidentity.ExtraConfigNamespaceOrgID, "org-1"))
+		})
 	})
 
 	Context("No VM Class ConfigSpec", func() {

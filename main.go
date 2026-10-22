@@ -35,6 +35,7 @@ import (
 	netopv1alpha1 "github.com/vmware-tanzu/net-operator-api/api/v1alpha1"
 
 	capv1 "github.com/vmware-tanzu/vm-operator/external/capabilities/api/v1alpha1"
+	topologyv1 "github.com/vmware-tanzu/vm-operator/external/tanzu-topology/api/v1alpha1"
 
 	"github.com/vmware-tanzu/vm-operator/controllers"
 	"github.com/vmware-tanzu/vm-operator/pkg"
@@ -46,6 +47,7 @@ import (
 	pkgmgr "github.com/vmware-tanzu/vm-operator/pkg/manager"
 	pkgmgrinit "github.com/vmware-tanzu/vm-operator/pkg/manager/init"
 	"github.com/vmware-tanzu/vm-operator/pkg/mem"
+	"github.com/vmware-tanzu/vm-operator/pkg/multivc"
 	"github.com/vmware-tanzu/vm-operator/pkg/util/kube/cource"
 	netsetutil "github.com/vmware-tanzu/vm-operator/pkg/util/kube/networksettings"
 	"github.com/vmware-tanzu/vm-operator/pkg/util/ovfcache"
@@ -68,6 +70,7 @@ var (
 	rateLimiterQPS                    int
 	rateLimiterBurst                  int
 	controllerMaxConcurrentReconciles string
+	shardFingerprint                  string
 	defaultConfig                     = pkgcfg.FromEnv()
 	logOptions                        = logs.NewOptions()
 	setupLog                          = klog.Background().WithName("setup")
@@ -93,17 +96,32 @@ func main() {
 
 	initFeatures()
 
-	initCRDs()
+	if !defaultConfig.MultiVC.IsShard() {
+		// The global or combined process installs the CRDs, so the shards
+		// do not race it.
+		initCRDs()
+	}
 
 	initClusterNetworkProviderTypes()
 
 	initRateLimiting()
 
-	waitForWebhookCertificates()
+	initMultiVC()
+
+	if pkgcfg.FromContext(ctx).MultiVC.RunsWebhooks() {
+		waitForWebhookCertificates()
+	}
 
 	initManager()
 
-	initWebhookServer(managerOpts.EnableWebhookClientVerification)
+	if pkgcfg.FromContext(ctx).MultiVC.RunsWebhooks() {
+		initWebhookServer(managerOpts.EnableWebhookClientVerification)
+	}
+
+	if err := multivc.AddReadinessCheck(mgr, pkgcfg.FromContext(ctx).MultiVC); err != nil {
+		setupLog.Error(err, "Unable to create readiness check")
+		os.Exit(1)
+	}
 
 	initSIGUSR2RestartHandler()
 
@@ -187,6 +205,54 @@ func initCRDs() {
 	if err := pkgcrd.Install(ctx, c, nil); err != nil {
 		setupLog.Error(err, "Failed to install/update CRDs")
 	}
+}
+
+// initMultiVC validates the multi-vCenter mode and suffixes the leader
+// election ID with it. A shard also reads its topology once: the zones of its
+// SDDC, and whether its SDDC is the only one. The shard's VM cache selector
+// and zone lookups are fixed from that topology, and the shard restarts when
+// it changes.
+func initMultiVC() {
+	multiVC := pkgcfg.FromContext(ctx).MultiVC
+	if err := multivc.ValidateIdentity(multiVC); err != nil {
+		setupLog.Error(err, "Invalid multi-vCenter configuration")
+		os.Exit(1)
+	}
+	managerOpts.LeaderElectionID = multivc.LeaderElectionID(managerOpts.LeaderElectionID, multiVC)
+
+	if !multiVC.IsShard() {
+		if multiVC.IsGlobal() {
+			setupLog.Info("Running in multi-vCenter global mode")
+		}
+		return
+	}
+
+	scheme := runtime.NewScheme()
+	_ = topologyv1.AddToScheme(scheme)
+	cfg := managerOpts.KubeConfig
+	if cfg == nil {
+		cfg = ctrl.GetConfigOrDie()
+	}
+	c, err := client.New(cfg, client.Options{Scheme: scheme})
+	if err != nil {
+		setupLog.Error(err, "Failed to create client for the multi-vCenter topology")
+		os.Exit(1)
+	}
+	t, err := multivc.LoadTopology(ctx, c, multiVC.ShardSDDC)
+	if err != nil {
+		setupLog.Error(err, "Failed to read the multi-vCenter topology", "sddc", multiVC.ShardSDDC)
+		os.Exit(1)
+	}
+	pkgcfg.SetContext(ctx, func(config *pkgcfg.Config) {
+		t.Apply(&config.MultiVC)
+	})
+	shardFingerprint = t.Fingerprint()
+
+	setupLog.Info("Running in multi-vCenter shard mode",
+		"sddc", multiVC.ShardSDDC,
+		"sddcs", t.SDDCs,
+		"ownedZones", t.Owned,
+		"sole", t.IsSole())
 }
 
 func initMemStats() {
@@ -460,6 +526,20 @@ func initManager() {
 		if err := services.AddToManager(ctx, mgr); err != nil {
 			return err
 		}
+		multiVC := pkgcfg.FromContext(ctx).MultiVC
+		if multiVC.IsShard() {
+			if err := mgr.Add(multivc.NewTopologyWatcher(
+				mgr.GetAPIReader(),
+				multiVC.ShardSDDC,
+				shardFingerprint,
+				multivc.DefaultTopologyPollInterval,
+				ctx.Logger.WithName("multivc"))); err != nil {
+				return err
+			}
+		}
+		if !multiVC.RunsWebhooks() {
+			return nil
+		}
 		return webhooks.AddToManager(ctx, mgr)
 	}
 
@@ -505,11 +585,6 @@ func initWebhookServer(enableWebhookClientVerification bool) {
 		srv.Options.TLSOpts = append(srv.Options.TLSOpts, clientCfgFunc)
 	}
 
-	setupLog.Info("Adding readiness check to controller manager")
-	if err := mgr.AddReadyzCheck("webhook", webhookServer.StartedChecker()); err != nil {
-		setupLog.Error(err, "Unable to create readiness check")
-		os.Exit(1)
-	}
 }
 
 func initSIGUSR2RestartHandler() {

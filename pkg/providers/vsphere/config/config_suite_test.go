@@ -15,6 +15,7 @@ import (
 
 func vcSimTests() {
 	Describe("Config", Label(testlabels.VCSim), configTests)
+	Describe("MultiVC", Label(testlabels.VCSim), multiVCTests)
 }
 
 var suite = builder.NewTestSuite()

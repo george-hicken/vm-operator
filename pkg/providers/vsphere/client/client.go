@@ -6,10 +6,16 @@ package client
 
 import (
 	"context"
+	"errors"
+	"fmt"
 
 	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/config"
 	"github.com/vmware-tanzu/vm-operator/pkg/util/vsphere/client"
 )
+
+// ErrVCenterMismatch is returned when the vCenter at a multi-vCenter shard's
+// endpoint is not the vCenter its SDDC records.
+var ErrVCenterMismatch = errors.New("vCenter instance UUID does not match the SDDC")
 
 type Client struct {
 	*client.Client
@@ -28,12 +34,25 @@ func NewClient(
 		Username:   config.VcCreds.Username,
 		Password:   config.VcCreds.Password,
 		CAFilePath: config.CAFilePath,
+		CAPEM:      config.CAPEM,
 		Insecure:   config.InsecureSkipTLSVerify,
 		Datacenter: config.Datacenter,
 	})
 
 	if err != nil {
 		return nil, err
+	}
+
+	// A multi-vCenter shard reaches its vCenter through an endpoint that its
+	// SDDC records. Check that the endpoint is the SDDC's vCenter before the
+	// client is used: MoIDs repeat across vCenters, so a client for the wrong
+	// vCenter would act on unrelated objects.
+	if want := config.VCenterUUID; want != "" {
+		if got := c.VimClient().ServiceContent.About.InstanceUuid; got != want {
+			c.Logout(ctx)
+			return nil, fmt.Errorf("%w: endpoint %s reports instance UUID %q, not %q",
+				ErrVCenterMismatch, config.VcPNID, got, want)
+		}
 	}
 
 	return &Client{

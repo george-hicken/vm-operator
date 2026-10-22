@@ -27,6 +27,8 @@ import (
 
 	vmopv1 "github.com/vmware-tanzu/vm-operator/api/v1alpha6"
 	vmopv1common "github.com/vmware-tanzu/vm-operator/api/v1alpha6/common"
+	vsphereconstants "github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/constants"
+	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/vmidentity"
 	"github.com/vmware-tanzu/vm-operator/pkg/util/ptr"
 
 	"github.com/vmware-tanzu/vm-operator/test/e2e/framework"
@@ -127,6 +129,45 @@ func VMExtraConfigSpec(ctx context.Context, inputGetter func() VMExtraConfigSpec
 			ctx, &config.Config, svClusterClient,
 			input.WCPNamespaceName, linuxImageDisplayName)
 	})
+
+	It("stamps the Supervisor, namespace/name, and organization on a new VC VM",
+		Label("core-functional", "experimental"), func() {
+			vmName := fmt.Sprintf("%s-identity-%s", specName, capiutil.RandomString(4))
+			vm := buildExtraConfigVM(buildExtraConfigVMOpts{
+				Name:         vmName,
+				Namespace:    input.WCPNamespaceName,
+				ClassName:    vmClassName,
+				ImageName:    linuxVMIName,
+				StorageClass: storageClass,
+			})
+			Expect(svClusterClient.Create(ctx, vm)).To(Succeed())
+			vmoperator.DeferCleanupVirtualMachine(config, svClusterClient, clusterProxy.GetKubeconfigPath(),
+				vm.Namespace, vm.Name, input.SkipCleanup)
+			vmoperator.WaitForVirtualMachineConditionCreated(
+				ctx, config, svClusterClient, vm.Namespace, vm.Name)
+			vm = getExtraConfigVM(ctx, svClusterClient,
+				types.NamespacedName{Namespace: vm.Namespace, Name: vm.Name})
+
+			supervisorID, err := vmidentity.GetSupervisorID(ctx, svClusterClient)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(supervisorID).ToNot(BeEmpty())
+			orgID, err := vmidentity.GetNamespaceOrgID(ctx, svClusterClient, vm.Namespace)
+			Expect(err).ToNot(HaveOccurred())
+
+			ref := vimtypes.ManagedObjectReference{Type: "VirtualMachine", Value: vm.Status.UniqueID}
+			var observed mo.VirtualMachine
+			Expect(property.DefaultCollector(vCenterClient).RetrieveOne(
+				ctx, ref, []string{"config.extraConfig"}, &observed)).To(Succeed())
+			Expect(observed.Config).ToNot(BeNil())
+			stamps := object.OptionValueList(observed.Config.ExtraConfig).StringMap()
+			Expect(stamps).To(HaveKeyWithValue(vmidentity.ExtraConfigSupervisorID, supervisorID))
+			Expect(stamps).To(HaveKeyWithValue(vsphereconstants.ExtraConfigVMServiceNamespacedName, vm.NamespacedName()))
+			if orgID == "" {
+				Expect(stamps).NotTo(HaveKey(vmidentity.ExtraConfigNamespaceOrgID))
+			} else {
+				Expect(stamps).To(HaveKeyWithValue(vmidentity.ExtraConfigNamespaceOrgID, orgID))
+			}
+		})
 
 	// ── It block 1: phases 1-2 ────────────────────────────────────────────────
 	// Creates a VM with PowerCycle first-class fields and two bag keys, waits for
