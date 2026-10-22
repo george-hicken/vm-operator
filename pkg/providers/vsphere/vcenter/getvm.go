@@ -7,6 +7,7 @@ package vcenter
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/vmware/govmomi/fault"
 	"github.com/vmware/govmomi/object"
@@ -67,7 +68,7 @@ func findVMByMoID(
 	}
 
 	vm := mo.VirtualMachine{}
-	if err := property.DefaultCollector(vimClient).RetrieveOne(vmCtx, moRef, []string{"name"}, &vm); err != nil {
+	if err := property.DefaultCollector(vimClient).RetrieveOne(vmCtx, moRef, []string{"name", "config.instanceUuid"}, &vm); err != nil {
 		var f *vimtypes.ManagedObjectNotFound
 		if _, ok := fault.As(err, &f); ok {
 			return nil, errVMNotFound
@@ -75,8 +76,35 @@ func findVMByMoID(
 		return nil, fmt.Errorf("error retrieving VM via MoID %q: %w", moID, err)
 	}
 
+	// A MoID is unique only within one vCenter. When a VM's status was
+	// written in another vCenter, the same MoID can name an unrelated VM in
+	// this one. Adopt the VM only when its instance UUID is one this VM can
+	// have, and otherwise fall back to the instance UUID lookup.
+	if vm.Config != nil && !instanceUUIDMatches(vmCtx, vm.Config.InstanceUuid) {
+		vmCtx.Logger.Info("Ignoring VM found via MoID with another instance UUID",
+			"moID", moID, "instanceUUID", vm.Config.InstanceUuid)
+		return nil, errVMNotFound
+	}
+
 	vmCtx.Logger.V(4).Info("Found VM via MoID", "moID", moID)
 	return object.NewVirtualMachine(vimClient, moRef), nil
+}
+
+// instanceUUIDMatches returns true when instanceUUID can belong to the VM:
+// it is the VM's spec.instanceUUID or, for VMs created before that field was
+// set, the VM's UID. A VM with neither, or a VC VM without an instance UUID,
+// cannot be checked and matches.
+func instanceUUIDMatches(vmCtx pkgctx.VirtualMachineContext, instanceUUID string) bool {
+	want := []string{vmCtx.VM.Spec.InstanceUUID, string(vmCtx.VM.UID)}
+	if instanceUUID == "" || (want[0] == "" && want[1] == "") {
+		return true
+	}
+	for _, w := range want {
+		if w != "" && strings.EqualFold(w, instanceUUID) {
+			return true
+		}
+	}
+	return false
 }
 
 func findVMByInstancedUUID(

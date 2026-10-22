@@ -76,6 +76,49 @@ func getVM() {
 		})
 	})
 
+	Context("MoID names a VM with another instance UUID", func() {
+		// This is what a VM whose status was written in another vCenter
+		// looks like: MoIDs repeat across vCenters, so the MoID can name an
+		// unrelated VM here.
+		const otherVCVMName = "DC0_C0_RP0_VM1"
+
+		var wantMoID string
+
+		BeforeEach(func() {
+			vm, err := ctx.Finder.VirtualMachine(ctx, vcVMName)
+			Expect(err).ToNot(HaveOccurred())
+			vmCtx.VM.Status.UniqueID = vm.Reference().Value
+
+			other, err := ctx.Finder.VirtualMachine(ctx, otherVCVMName)
+			Expect(err).ToNot(HaveOccurred())
+			var o mo.VirtualMachine
+			Expect(other.Properties(ctx, other.Reference(), []string{"config.instanceUuid"}, &o)).To(Succeed())
+			vmCtx.VM.Spec.InstanceUUID = o.Config.InstanceUuid
+			wantMoID = other.Reference().Value
+		})
+
+		It("returns the VM with the matching instance UUID, not the MoID's", func() {
+			vm, err := vcenter.GetVirtualMachine(vmCtx, ctx.VCClient.Client, ctx.Datacenter)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(vm).ToNot(BeNil())
+			Expect(vm.Reference().Value).To(Equal(wantMoID))
+			Expect(vm.Reference().Value).ToNot(Equal(vmCtx.VM.Status.UniqueID))
+		})
+
+		When("no VM has the instance UUID", func() {
+			BeforeEach(func() {
+				vmCtx.VM.Spec.InstanceUUID = "00000000-0000-0000-0000-00000000beef"
+				vmCtx.VM.UID = ""
+			})
+
+			It("returns no VM", func() {
+				vm, err := vcenter.GetVirtualMachine(vmCtx, ctx.VCClient.Client, ctx.Datacenter)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(vm).To(BeNil())
+			})
+		})
+	})
+
 	Context("Gets VM by UUID from Spec", func() {
 		BeforeEach(func() {
 			vm, err := ctx.Finder.VirtualMachine(ctx, vcVMName)
