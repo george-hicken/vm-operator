@@ -6,6 +6,9 @@ package multivc_test
 
 import (
 	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -18,6 +21,9 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/healthz"
+	ctrlmgr "sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	vmopv1 "github.com/vmware-tanzu/vm-operator/api/v1alpha6"
 	topologyv1 "github.com/vmware-tanzu/vm-operator/external/tanzu-topology/api/v1alpha1"
@@ -323,5 +329,58 @@ var _ = Describe("Dependents", Label(testlabels.API), func() {
 		sole.Sole = true
 		Expect(admits(sole, empty, "vm-1")).To(BeTrue())
 		Expect(admits(pkgcfg.MultiVC{}, empty, "vm-1")).To(BeTrue())
+	})
+})
+
+type readinessManager struct {
+	ctrlmgr.Manager
+	handler           healthz.Handler
+	server            webhook.Server
+	registrationError error
+}
+
+func (m *readinessManager) AddReadyzCheck(name string, check healthz.Checker) error {
+	if m.registrationError != nil {
+		return m.registrationError
+	}
+	m.handler.Checks = map[string]healthz.Checker{name: check}
+	return nil
+}
+
+func (m *readinessManager) GetWebhookServer() webhook.Server {
+	// Shard tests leave this nil: requesting a server would fail the test.
+	return m.server
+}
+
+var _ = Describe("Readiness", Label(testlabels.API), func() {
+	It("Should serve the shard readiness probe without a webhook server", func() {
+		mgr := &readinessManager{}
+		Expect(multivc.AddReadinessCheck(mgr, pkgcfg.MultiVC{
+			Mode: pkgcfg.MultiVCModeShard, ShardSDDC: "vc-2",
+		})).To(Succeed())
+		mux := http.NewServeMux()
+		mux.Handle("/readyz", http.StripPrefix("/readyz", &mgr.handler))
+		response := httptest.NewRecorder()
+		mux.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+		Expect(response.Code).To(Equal(http.StatusOK))
+	})
+
+	DescribeTable("Should retain webhook readiness for processes serving webhooks", func(mode pkgcfg.MultiVCMode) {
+		mgr := &readinessManager{server: webhook.NewServer(webhook.Options{})}
+		Expect(multivc.AddReadinessCheck(mgr, pkgcfg.MultiVC{Mode: mode})).To(Succeed())
+		Expect(mgr.handler.Checks).To(HaveKey("webhook"))
+		response := httptest.NewRecorder()
+		mgr.handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+		// An unstarted webhook server must keep these processes unready.
+		Expect(response.Code).To(Equal(http.StatusInternalServerError))
+	},
+		Entry("combined", pkgcfg.MultiVCModeCombined),
+		Entry("global", pkgcfg.MultiVCModeGlobal),
+	)
+
+	It("Should report readiness registration failures", func() {
+		mgr := &readinessManager{registrationError: errors.New("registration failed")}
+		Expect(multivc.AddReadinessCheck(mgr, pkgcfg.MultiVC{Mode: pkgcfg.MultiVCModeShard})).To(
+			MatchError(ContainSubstring("registration failed")))
 	})
 })

@@ -118,6 +118,11 @@ func main() {
 		initWebhookServer(managerOpts.EnableWebhookClientVerification)
 	}
 
+	if err := multivc.AddReadinessCheck(mgr, pkgcfg.FromContext(ctx).MultiVC); err != nil {
+		setupLog.Error(err, "Unable to create readiness check")
+		os.Exit(1)
+	}
+
 	initSIGUSR2RestartHandler()
 
 	setupLog.Info("Starting controller manager")
@@ -580,11 +585,6 @@ func initWebhookServer(enableWebhookClientVerification bool) {
 		srv.Options.TLSOpts = append(srv.Options.TLSOpts, clientCfgFunc)
 	}
 
-	setupLog.Info("Adding readiness check to controller manager")
-	if err := mgr.AddReadyzCheck("webhook", webhookServer.StartedChecker()); err != nil {
-		setupLog.Error(err, "Unable to create readiness check")
-		os.Exit(1)
-	}
 }
 
 func initSIGUSR2RestartHandler() {
