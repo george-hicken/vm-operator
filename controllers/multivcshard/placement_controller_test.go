@@ -6,15 +6,18 @@ package multivcshard_test
 
 import (
 	"context"
+	"time"
 
 	"github.com/go-logr/logr"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	vmopv1 "github.com/vmware-tanzu/vm-operator/api/v1alpha6"
 	"github.com/vmware-tanzu/vm-operator/controllers/multivcshard"
@@ -99,6 +102,70 @@ var _ = Describe("Placement", Label(testlabels.Controller), func() {
 		By("leaving a VM that has a zone as it is", func() {
 			Expect(reconcile().Labels[corev1.LabelTopologyZone]).To(Equal("zone-2"))
 			Expect(chosen).To(HaveLen(1))
+		})
+	})
+
+	It("Should preserve a concurrent zone assignment and return a conflict for retry", func() {
+		key := ctrlclient.ObjectKey{Namespace: namespace, Name: "vm"}
+		patches := 0
+		r.Client = interceptor.NewClient(client.(ctrlclient.WithWatch), interceptor.Funcs{
+			Patch: func(ctx context.Context, c ctrlclient.WithWatch, obj ctrlclient.Object, patch ctrlclient.Patch, opts ...ctrlclient.PatchOption) error {
+				patches++
+				By("persisting another writer's zone after the placement read")
+				winner := &vmopv1.VirtualMachine{}
+				Expect(client.Get(ctx, key, winner)).To(Succeed())
+				winner.Labels = map[string]string{corev1.LabelTopologyZone: "zone-1"}
+				Expect(client.Update(ctx, winner)).To(Succeed())
+				return c.Patch(ctx, obj, patch, opts...)
+			},
+		})
+
+		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+		Expect(apierrors.IsConflict(err)).To(BeTrue())
+		winner := &vmopv1.VirtualMachine{}
+		Expect(client.Get(ctx, key, winner)).To(Succeed())
+		Expect(winner.Labels[corev1.LabelTopologyZone]).To(Equal("zone-1"))
+		Expect(chosen).To(Equal([]int{2}))
+
+		By("retrying against the persisted winner without another assignment")
+		Expect(reconcile().Labels[corev1.LabelTopologyZone]).To(Equal("zone-1"))
+		Expect(patches).To(Equal(1))
+		Expect(chosen).To(HaveLen(1))
+	})
+
+	When("the namespace has no zone", func() {
+		BeforeEach(func() {
+			for i := len(objs) - 1; i >= 0; i-- {
+				if _, ok := objs[i].(*topologyv1.Zone); ok {
+					objs = append(objs[:i], objs[i+1:]...)
+				}
+			}
+		})
+
+		It("Should keep retrying an unchanged condition and place after dependency recovery", func() {
+			key := ctrlclient.ObjectKey{Namespace: namespace, Name: "vm"}
+			result, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(30 * time.Second))
+			waiting := &vmopv1.VirtualMachine{}
+			Expect(client.Get(ctx, key, waiting)).To(Succeed())
+			Expect(pkgcond.Get(waiting, multivc.ConditionPlaced).Reason).To(Equal(multivc.ReasonNoEligibleZone))
+			rv := waiting.ResourceVersion
+
+			By("retaining the retry when NoEligibleZone no longer needs a write")
+			result, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(30 * time.Second))
+			Expect(client.Get(ctx, key, waiting)).To(Succeed())
+			Expect(waiting.ResourceVersion).To(Equal(rv))
+
+			By("recovering eligibility without updating the VM")
+			Expect(client.Create(ctx, &topologyv1.Zone{ObjectMeta: metav1.ObjectMeta{Name: "zone-1", Namespace: namespace}})).To(Succeed())
+			Expect(client.Get(ctx, key, waiting)).To(Succeed())
+			Expect(waiting.ResourceVersion).To(Equal(rv))
+			Expect(reconcile().Labels[corev1.LabelTopologyZone]).To(Equal("zone-1"))
+			Expect(chosen).To(Equal([]int{1}))
+			Expect(pkgcond.Get(reconcile(), multivc.ConditionPlaced)).To(BeNil())
 		})
 	})
 

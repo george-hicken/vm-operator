@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"slices"
+	"time"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
@@ -27,7 +28,10 @@ import (
 	"github.com/vmware-tanzu/vm-operator/pkg/topology"
 )
 
-const placementControllerName = "multivc-placement-controller"
+const (
+	placementControllerName = "multivc-placement-controller"
+	placementRetryInterval  = 30 * time.Second
+)
 
 // AddPlacementToManager adds the controller that assigns a zone to a VM that
 // has none while the Supervisor has several SDDCs. It runs in the
@@ -105,19 +109,20 @@ func (r *PlacementReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, err
 	}
 	if len(zones) == 0 {
-		return ctrl.Result{}, r.markNoEligibleZone(ctx, vm, len(sddcs))
+		// Eligibility can recover without a VM event; dependencies are not watched.
+		return ctrl.Result{RequeueAfter: placementRetryInterval}, r.markNoEligibleZone(ctx, vm, len(sddcs))
 	}
 
 	zone := zones[r.Choose(len(zones))]
 
-	// Add the zone label and nothing else. The merge patch carries only the
-	// label, so it cannot overwrite a field another writer set.
+	// Preserve a zone assigned after our cached read. A conflict retries the
+	// reconcile, which then leaves the winning assignment unchanged.
 	orig := vm.DeepCopy()
 	if vm.Labels == nil {
 		vm.Labels = map[string]string{}
 	}
 	vm.Labels[corev1.LabelTopologyZone] = zone
-	if err := r.Patch(ctx, vm, ctrlclient.MergeFrom(orig)); err != nil {
+	if err := r.Patch(ctx, vm, ctrlclient.MergeFromWithOptions(orig, ctrlclient.MergeFromWithOptimisticLock{})); err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to set the zone of VM %s: %w", req.NamespacedName, err)
 	}
 	r.Logger.Info("Assigned VM to a zone", "vm", req.NamespacedName, "zone", zone, "candidates", zones)
