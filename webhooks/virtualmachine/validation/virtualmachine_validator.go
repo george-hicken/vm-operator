@@ -2642,6 +2642,12 @@ func (v validator) validateAvailabilityZone(
 	return allErrs
 }
 
+func annotationChanged(newAnnotations, oldAnnotations map[string]string, key string) bool {
+	newValue, newPresent := newAnnotations[key]
+	oldValue, oldPresent := oldAnnotations[key]
+	return newPresent != oldPresent || newValue != oldValue
+}
+
 func (v validator) validateAnnotation(ctx *pkgctx.WebhookRequestContext, vm, oldVM *vmopv1.VirtualMachine) field.ErrorList {
 	var allErrs field.ErrorList
 
@@ -2674,15 +2680,15 @@ func (v validator) validateAnnotation(ctx *pkgctx.WebhookRequestContext, vm, old
 		allErrs = append(allErrs, field.Forbidden(annotationPath.Key(vmopv1.FirstBootDoneAnnotation), modifyAnnotationNotAllowedForNonAdmin))
 	}
 
-	if vm.Annotations[vmopv1.RestoredVMAnnotation] != oldVM.Annotations[vmopv1.RestoredVMAnnotation] {
+	if annotationChanged(vm.Annotations, oldVM.Annotations, vmopv1.RestoredVMAnnotation) {
 		allErrs = append(allErrs, field.Forbidden(annotationPath.Key(vmopv1.RestoredVMAnnotation), modifyAnnotationNotAllowedForNonAdmin))
 	}
 
-	if vm.Annotations[vmopv1.FailedOverVMAnnotation] != oldVM.Annotations[vmopv1.FailedOverVMAnnotation] {
+	if annotationChanged(vm.Annotations, oldVM.Annotations, vmopv1.FailedOverVMAnnotation) {
 		allErrs = append(allErrs, field.Forbidden(annotationPath.Key(vmopv1.FailedOverVMAnnotation), modifyAnnotationNotAllowedForNonAdmin))
 	}
 
-	if vm.Annotations[vmopv1.ImportedVMAnnotation] != oldVM.Annotations[vmopv1.ImportedVMAnnotation] {
+	if annotationChanged(vm.Annotations, oldVM.Annotations, vmopv1.ImportedVMAnnotation) {
 		allErrs = append(allErrs, field.Forbidden(annotationPath.Key(vmopv1.ImportedVMAnnotation), modifyAnnotationNotAllowedForNonAdmin))
 	}
 

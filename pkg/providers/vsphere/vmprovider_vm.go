@@ -61,6 +61,7 @@ import (
 	upgradevm "github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/upgrade/virtualmachine"
 	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/vcenter"
 	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/virtualmachine"
+	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/vmidentity"
 	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/vmlifecycle"
 	"github.com/vmware-tanzu/vm-operator/pkg/topology"
 	pkgutil "github.com/vmware-tanzu/vm-operator/pkg/util"
@@ -126,6 +127,10 @@ type vmUpdateArgs = session.VMUpdateArgs
 type vmResizeArgs = session.VMResizeArgs
 
 var (
+	// ErrShardCleanupUnsupported prevents partial ownership release until the
+	// shard has a durable cleanup protocol that survives retries and crashes.
+	ErrShardCleanupUnsupported = errors.New("unregistering a VM in shard mode is unsupported")
+
 	createCountLock       sync.Mutex
 	concurrentCreateCount int
 
@@ -198,6 +203,20 @@ func (vs *vSphereVMProvider) createOrUpdateVirtualMachine(
 	if err != nil {
 		return nil, err
 	}
+
+	id, err := vs.getVMIdentity(ctx, vm)
+	if err != nil {
+		return nil, err
+	}
+	ctx = vmidentity.WithContext(ctx, id)
+	if vm.DeletionTimestamp.IsZero() {
+		if _, imported := vm.Annotations[vmopv1.ImportedVMAnnotation]; imported {
+			ctx = vmidentity.WithAdoption(ctx)
+		} else if _, restored := vm.Annotations[vmopv1.RestoredVMAnnotation]; restored {
+			ctx = vmidentity.WithAdoption(ctx)
+		}
+	}
+	vmCtx.Context = ctx
 
 	// Set the VC UUID annotation on the VM before attempting creation or
 	// update. Among other things, the annotation facilitates differential
@@ -329,6 +348,9 @@ func (vs *vSphereVMProvider) createOrUpdateVirtualMachine(
 func (vs *vSphereVMProvider) CleanupVirtualMachine(
 	ctx context.Context,
 	vm *vmopv1.VirtualMachine) error {
+	if pkgcfg.FromContext(ctx).MultiVC.IsShard() {
+		return ErrShardCleanupUnsupported
+	}
 
 	vmNamespacedName := vm.NamespacedName()
 
@@ -3462,4 +3484,32 @@ func (vs *vSphereVMProvider) vmResizeGetArgs(
 	}
 
 	return resizeArgs, nil
+}
+
+// getVMIdentity returns the identity to stamp on the VM's VC VM. The
+// Supervisor ID is cached once it is found.
+func (vs *vSphereVMProvider) getVMIdentity(
+	ctx context.Context,
+	vm *vmopv1.VirtualMachine) (vmidentity.Identity, error) {
+
+	var id vmidentity.Identity
+	if p := vs.supervisorID.Load(); p != nil {
+		id.SupervisorID = *p
+	} else {
+		sid, err := vmidentity.GetSupervisorID(ctx, vs.k8sClient)
+		if err != nil {
+			return id, err
+		}
+		if sid != "" {
+			vs.supervisorID.Store(&sid)
+		}
+		id.SupervisorID = sid
+	}
+
+	orgID, err := vmidentity.GetNamespaceOrgID(ctx, vs.k8sClient, vm.Namespace)
+	if err != nil {
+		return id, err
+	}
+	id.OrgID = orgID
+	return id, nil
 }

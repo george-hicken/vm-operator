@@ -5,6 +5,7 @@
 package vsphere_test
 
 import (
+	"errors"
 	"path/filepath"
 	"time"
 
@@ -17,6 +18,8 @@ import (
 
 	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/vim25/mo"
+	vimtypes "github.com/vmware/govmomi/vim25/types"
+	corev1 "k8s.io/api/core/v1"
 
 	vmopv1 "github.com/vmware-tanzu/vm-operator/api/v1alpha6"
 	"github.com/vmware-tanzu/vm-operator/pkg/conditions"
@@ -26,7 +29,10 @@ import (
 	pkgerr "github.com/vmware-tanzu/vm-operator/pkg/errors"
 	"github.com/vmware-tanzu/vm-operator/pkg/providers"
 	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere"
+	vsphereconstants "github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/constants"
+	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/vcenter"
 	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/virtualmachine"
+	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/vmidentity"
 	kubeutil "github.com/vmware-tanzu/vm-operator/pkg/util/kube"
 	vmconfunmanagedvolsfil "github.com/vmware-tanzu/vm-operator/pkg/vmconfig/volumes/unmanaged/backfill"
 	vmconfunmanagedvolsreg "github.com/vmware-tanzu/vm-operator/pkg/vmconfig/volumes/unmanaged/register"
@@ -67,6 +73,9 @@ var _ = Describe(
 			By("Creating VM CR")
 			vm = builder.DummyBasicVirtualMachine(dummySnapshot, nsInfo.Namespace)
 			vm.Status.UniqueID = vcVM.Reference().Value
+			var moVM mo.VirtualMachine
+			Expect(vcVM.Properties(ctx, vcVM.Reference(), []string{"config.instanceUuid"}, &moVM)).To(Succeed())
+			vm.Spec.InstanceUUID = moVM.Config.InstanceUuid
 			Expect(ctx.Client.Create(ctx, vm)).To(Succeed())
 
 			By("Creating snapshot CR")
@@ -104,6 +113,80 @@ var _ = Describe(
 			nsInfo = builder.WorkloadNamespaceInfo{}
 		})
 
+		It("blocks snapshot and VM deletion when the VC VM belongs to another Supervisor", func() {
+			task, err := vcVM.Reconfigure(ctx, vimtypes.VirtualMachineConfigSpec{
+				ExtraConfig: []vimtypes.BaseOptionValue{
+					&vimtypes.OptionValue{Key: vmidentity.ExtraConfigSupervisorID, Value: "foreign-supervisor"},
+				},
+			})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(task.Wait(ctx)).To(Succeed())
+
+			deleted, err := vmProvider.DeleteSnapshot(ctx, vmSnapshot, vm, true, nil)
+			Expect(deleted).To(BeFalse())
+			Expect(errors.Is(err, vcenter.ErrVMIdentityMismatch)).To(BeTrue())
+			snapMoRef, err := vcVM.FindSnapshot(ctx, dummySnapshot)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(snapMoRef).ToNot(BeNil())
+
+			err = vmProvider.DeleteVirtualMachine(ctx, vm)
+			Expect(errors.Is(err, vcenter.ErrVMIdentityMismatch)).To(BeTrue())
+			var moVM mo.VirtualMachine
+			Expect(vcVM.Properties(ctx, vcVM.Reference(), []string{"config.instanceUuid"}, &moVM)).To(Succeed())
+		})
+
+		It("rejects shard lookups with a typed error when the local Supervisor ID is unavailable", func() {
+			_, err := vmProvider.GetSnapshotSize(ctx, vmSnapshot.Name, vm)
+			Expect(err).ToNot(HaveOccurred())
+			pkgcfg.SetContext(ctx, func(config *pkgcfg.Config) {
+				config.MultiVC.Mode = pkgcfg.MultiVCModeShard
+			})
+
+			_, err = vmProvider.GetSnapshotSize(ctx, vmSnapshot.Name, vm)
+			Expect(errors.Is(err, vcenter.ErrVMIdentityMismatch)).To(BeTrue())
+			Expect(errors.Is(vmProvider.DeleteVirtualMachine(ctx, vm), vcenter.ErrVMIdentityMismatch)).To(BeTrue())
+			var observed mo.VirtualMachine
+			Expect(vcVM.Properties(ctx, vcVM.Reference(), []string{"config.instanceUuid"}, &observed)).To(Succeed())
+		})
+
+		It("does not use an import annotation to delete or clean an unstamped VM in shard mode", func() {
+			_, err := vmProvider.GetSnapshotSize(ctx, vmSnapshot.Name, vm)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(ctx.Client.Create(ctx, &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: "wcp-cluster-config"},
+				Data:       map[string]string{"wcp-cluster-config.yaml": "supervisor_id: supervisor-a\n"},
+			})).To(Succeed())
+			pkgcfg.SetContext(ctx, func(config *pkgcfg.Config) {
+				config.MultiVC.Mode = pkgcfg.MultiVCModeShard
+			})
+			vm.Annotations = map[string]string{vmopv1.ImportedVMAnnotation: ""}
+
+			deleted, err := vmProvider.DeleteSnapshot(ctx, vmSnapshot, vm, true, nil)
+			Expect(deleted).To(BeFalse())
+			Expect(errors.Is(err, vcenter.ErrVMIdentityMismatch)).To(BeTrue())
+			Expect(errors.Is(vmProvider.CleanupVirtualMachine(ctx, vm),
+				vsphere.ErrShardCleanupUnsupported)).To(BeTrue())
+			Expect(errors.Is(vmProvider.DeleteVirtualMachine(ctx, vm), vcenter.ErrVMIdentityMismatch)).To(BeTrue())
+			snapMoRef, err := vcVM.FindSnapshot(ctx, dummySnapshot)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(snapMoRef).ToNot(BeNil())
+
+			task, err := vcVM.Reconfigure(ctx, vimtypes.VirtualMachineConfigSpec{
+				ExtraConfig: []vimtypes.BaseOptionValue{
+					&vimtypes.OptionValue{Key: vmidentity.ExtraConfigSupervisorID, Value: "supervisor-a"},
+					&vimtypes.OptionValue{Key: vsphereconstants.ExtraConfigVMServiceNamespacedName, Value: vm.NamespacedName()},
+				},
+			})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(task.Wait(ctx)).To(Succeed())
+			Expect(errors.Is(vmProvider.CleanupVirtualMachine(ctx, vm),
+				vsphere.ErrShardCleanupUnsupported)).To(BeTrue())
+			var observed mo.VirtualMachine
+			Expect(vcVM.Properties(ctx, vcVM.Reference(), []string{"config.extraConfig"}, &observed)).To(Succeed())
+			stamps := object.OptionValueList(observed.Config.ExtraConfig).StringMap()
+			Expect(stamps).To(HaveKeyWithValue(vmidentity.ExtraConfigSupervisorID, "supervisor-a"))
+		})
+
 		Context("GetSnapshotSize", func() {
 			It("should return the size of the snapshot", func() {
 				size, err := vmProvider.GetSnapshotSize(ctx, vmSnapshot.Name, vm)
@@ -125,6 +208,7 @@ var _ = Describe(
 			When("there is issue finding vm", func() {
 				BeforeEach(func() {
 					vm.Status.UniqueID = ""
+					vm.Spec.InstanceUUID = ""
 				})
 				It("should return error", func() {
 					size, err := vmProvider.GetSnapshotSize(ctx, vmSnapshot.Name, vm)
@@ -166,6 +250,7 @@ var _ = Describe(
 			Context("VM is not found", func() {
 				BeforeEach(func() {
 					vm.Status.UniqueID = ""
+					vm.Spec.InstanceUUID = ""
 				})
 				It("should return true and no error", func() {
 					Expect(deleted).To(BeTrue())
@@ -206,6 +291,7 @@ var _ = Describe(
 			When("VM is not found", func() {
 				BeforeEach(func() {
 					vm.Status.UniqueID = ""
+					vm.Spec.InstanceUUID = ""
 				})
 				It("should return error", func() {
 					Expect(vmProvider.SyncVMSnapshotTreeStatus(ctx, vm)).NotTo(Succeed())

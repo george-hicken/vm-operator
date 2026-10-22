@@ -44,6 +44,7 @@ import (
 	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/contentlibrary"
 	vccreds "github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/credentials"
 	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/vcenter"
+	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/vmidentity"
 	"github.com/vmware-tanzu/vm-operator/pkg/record"
 	"github.com/vmware-tanzu/vm-operator/pkg/topology"
 	pkgutil "github.com/vmware-tanzu/vm-operator/pkg/util"
@@ -67,6 +68,9 @@ type vSphereVMProvider struct {
 	vcClient     *vcclient.Client
 	// vcClientReplaced is closed, and then replaced, whenever vcClient is cleared for a new one.
 	vcClientReplaced chan struct{}
+
+	// supervisorID caches this Supervisor's ID once it is known.
+	supervisorID atomic.Pointer[string]
 }
 
 func NewVSphereVMProviderFromClient(
@@ -534,6 +538,19 @@ func (vs *vSphereVMProvider) getVM(
 	vmCtx pkgctx.VirtualMachineContext,
 	client *vcclient.Client,
 	notFoundReturnErr bool) (*object.VirtualMachine, error) {
+
+	if vmidentity.FromContext(vmCtx).SupervisorID == "" {
+		id, err := vs.getVMIdentity(vmCtx, vmCtx.VM)
+		if err != nil {
+			return nil, err
+		}
+		vmCtx.Context = vmidentity.WithContext(vmCtx, id)
+	}
+	if pkgcfg.FromContext(vmCtx).MultiVC.IsShard() &&
+		vmidentity.FromContext(vmCtx).SupervisorID == "" {
+		return nil, fmt.Errorf("%w: cannot look up VM %q without Supervisor ID",
+			vcenter.ErrVMIdentityMismatch, vmCtx.VM.NamespacedName())
+	}
 
 	vcVM, err := vcenter.GetVirtualMachine(vmCtx, client.VimClient(), client.Datacenter())
 	if err != nil {

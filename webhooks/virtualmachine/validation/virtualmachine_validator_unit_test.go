@@ -1457,6 +1457,17 @@ func unitTestsValidateCreate() {
 					),
 				},
 			),
+			Entry("should disallow an empty import annotation from an SSO user",
+				testParams{
+					setup: func(ctx *unitValidatingWebhookContext) {
+						ctx.vm.Annotations[vmopv1.ImportedVMAnnotation] = ""
+					},
+					validate: doValidateWithMsg(
+						field.Forbidden(annotationPath.Key(vmopv1.ImportedVMAnnotation),
+							"modifying this annotation is not allowed for non-admin users").Error(),
+					),
+				},
+			),
 			Entry("should allow creating VM with admin-only annotations set by service user",
 				testParams{
 					setup: func(ctx *unitValidatingWebhookContext) {
@@ -5840,6 +5851,18 @@ func unitTestsValidateUpdate() {
 						field.Forbidden(annotationPath.Key(vmopv1.FailedOverVMAnnotation), "modifying this annotation is not allowed for non-admin users").Error(),
 						field.Forbidden(annotationPath.Key(anno2extraconfig.ManagementProxyAllowListAnnotation), "modifying this annotation is not allowed for non-admin users").Error(),
 						field.Forbidden(annotationPath.Key(anno2extraconfig.ManagementProxyWatermarkAnnotation), "modifying this annotation is not allowed for non-admin users").Error(),
+					),
+				},
+			),
+			Entry("should disallow adding an empty restore annotation by SSO user",
+				testParams{
+					setup: func(ctx *unitValidatingWebhookContext) {
+						bypassUpgradeCheck(&ctx.Context, ctx.vm, ctx.oldVM)
+						ctx.vm.Annotations[vmopv1.RestoredVMAnnotation] = ""
+					},
+					validate: doValidateWithMsg(
+						field.Forbidden(annotationPath.Key(vmopv1.RestoredVMAnnotation),
+							"modifying this annotation is not allowed for non-admin users").Error(),
 					),
 				},
 			),
