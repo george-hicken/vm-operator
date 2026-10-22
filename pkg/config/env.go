@@ -34,6 +34,8 @@ func FromEnv() Config {
 	setString(env.FastDeployMode, &config.FastDeployMode)
 	setString(env.VCCredsSecretName, &config.VCCredsSecretName)
 	setBool(env.CRDCleanupEnabled, &config.CRDCleanupEnabled)
+	setMultiVCMode(env.MultiVCMode, &config.MultiVC.Mode)
+	setString(env.MultiVCShardSDDC, &config.MultiVC.ShardSDDC)
 
 	setDuration(env.InstanceStoragePVPlacementFailedTTL, &config.InstanceStorage.PVPlacementFailedTTL)
 	setFloat64(env.InstanceStorageJitterMaxFactor, &config.InstanceStorage.JitterMaxFactor)
@@ -112,6 +114,12 @@ func setInt(n env.VarName, p *int) {
 func setNetworkProviderType(n env.VarName, p *NetworkProviderType) {
 	if v := os.Getenv(n.String()); v != "" {
 		*p = NetworkProviderType(v)
+	}
+}
+
+func setMultiVCMode(n env.VarName, p *MultiVCMode) {
+	if v := os.Getenv(n.String()); v != "" {
+		*p = MultiVCMode(v)
 	}
 }
 

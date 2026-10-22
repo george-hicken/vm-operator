@@ -36,4 +36,46 @@ var _ = Describe("Config", func() {
 			})
 		})
 	})
+
+	Describe("MultiVC", func() {
+		It("Should default to combined mode, which owns every zone", func() {
+			m := pkgcfg.Default().MultiVC
+			Expect(m.Mode).To(Equal(pkgcfg.MultiVCModeCombined))
+			Expect(m.RunsWebhooks()).To(BeTrue())
+			Expect(m.HasVCClient()).To(BeTrue())
+			Expect(m.OwnsZone("any")).To(BeTrue())
+		})
+		It("Should own every zone in global mode, and create no vCenter client", func() {
+			m := pkgcfg.MultiVC{Mode: pkgcfg.MultiVCModeGlobal}
+			Expect(m.IsGlobal()).To(BeTrue())
+			Expect(m.RunsWebhooks()).To(BeTrue())
+			Expect(m.HasVCClient()).To(BeFalse())
+			Expect(m.OwnsZone("any")).To(BeTrue())
+		})
+		It("Should own only its zones in a non-primary shard", func() {
+			m := pkgcfg.MultiVC{
+				Mode:         pkgcfg.MultiVCModeShard,
+				ShardSDDC:    "sddc-2",
+				OwnedZones:   "zone-2a,zone-2b",
+				ForeignZones: "zone-1",
+			}
+			Expect(m.RunsWebhooks()).To(BeFalse())
+			Expect(m.HasVCClient()).To(BeTrue())
+			Expect(m.OwnsZone("zone-2a")).To(BeTrue())
+			Expect(m.OwnsZone("zone-1")).To(BeFalse())
+			Expect(m.OwnsZone("unowned")).To(BeFalse())
+		})
+		It("Should own its zones and the unowned zones in the primary shard", func() {
+			m := pkgcfg.MultiVC{
+				Mode:         pkgcfg.MultiVCModeShard,
+				ShardSDDC:    "sddc-1",
+				Primary:      true,
+				OwnedZones:   "zone-1",
+				ForeignZones: "zone-2a,zone-2b",
+			}
+			Expect(m.OwnsZone("zone-1")).To(BeTrue())
+			Expect(m.OwnsZone("unowned")).To(BeTrue())
+			Expect(m.OwnsZone("zone-2b")).To(BeFalse())
+		})
+	})
 })

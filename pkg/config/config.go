@@ -5,6 +5,7 @@
 package config
 
 import (
+	"slices"
 	"time"
 )
 
@@ -174,6 +175,89 @@ type Config struct {
 	// Please note, this field has no effect if a CRD is being installed for the
 	// first time.
 	CRDCleanupEnabled bool
+
+	// MultiVC configures how this process takes part in a Supervisor that
+	// spans more than one vCenter. The zero value is the combined mode, which
+	// is the behavior of a single vCenter.
+	MultiVC MultiVC
+}
+
+// MultiVCMode is the part of a multi-vCenter deployment that a VM Operator
+// process runs.
+type MultiVCMode string
+
+const (
+	// MultiVCModeCombined runs every controller and webhook against one
+	// vCenter. It is the default.
+	MultiVCModeCombined MultiVCMode = ""
+
+	// MultiVCModeGlobal runs the webhooks and the controllers that need no
+	// vCenter client, and renders one shard per SDDC. It never creates a
+	// vCenter client.
+	MultiVCModeGlobal MultiVCMode = "global"
+
+	// MultiVCModeShard runs the controllers that need a vCenter client, for
+	// the VMs in the zones of one SDDC.
+	MultiVCModeShard MultiVCMode = "shard"
+)
+
+// MultiVC is the multi-vCenter configuration of a VM Operator process.
+//
+// The zone lists are comma-delimited strings rather than slices for the
+// reason given in the GoDocs for the Config type.
+type MultiVC struct {
+	// Mode is the part of the deployment this process runs.
+	Mode MultiVCMode
+
+	// ShardSDDC is the name of the SDDC whose zones a shard owns. It is set
+	// only in shard mode.
+	ShardSDDC string
+
+	// Primary is true for the shard of the primary SDDC. The primary shard
+	// also owns the zones that no SDDC owns, and VMs that have no zone.
+	Primary bool
+
+	// OwnedZones is the comma-delimited list of the zones whose
+	// AvailabilityZone is owned by ShardSDDC.
+	OwnedZones string
+
+	// ForeignZones is the comma-delimited list of the zones whose
+	// AvailabilityZone is owned by another SDDC.
+	ForeignZones string
+}
+
+// IsShard returns true when the process runs in shard mode.
+func (m MultiVC) IsShard() bool {
+	return m.Mode == MultiVCModeShard
+}
+
+// IsGlobal returns true when the process runs in global mode.
+func (m MultiVC) IsGlobal() bool {
+	return m.Mode == MultiVCModeGlobal
+}
+
+// RunsWebhooks returns true when the process serves the admission webhooks,
+// which is in combined and global mode.
+func (m MultiVC) RunsWebhooks() bool {
+	return m.Mode != MultiVCModeShard
+}
+
+// HasVCClient returns true when the process may create a vCenter client,
+// which is in combined and shard mode.
+func (m MultiVC) HasVCClient() bool {
+	return m.Mode != MultiVCModeGlobal
+}
+
+// OwnsZone returns true when the process is responsible for the named zone.
+// Outside shard mode every zone is owned.
+func (m MultiVC) OwnsZone(name string) bool {
+	if !m.IsShard() {
+		return true
+	}
+	if slices.Contains(StringToSlice(m.OwnedZones), name) {
+		return true
+	}
+	return m.Primary && !slices.Contains(StringToSlice(m.ForeignZones), name)
 }
 
 // GetMaxDeployThreadsOnProvider returns MaxDeployThreadsOnProvider if it is >0
