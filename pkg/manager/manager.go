@@ -40,8 +40,10 @@ import (
 	vspherepolv1 "github.com/vmware-tanzu/vm-operator/external/vsphere-policy/api/v1alpha1"
 
 	vmopapi "github.com/vmware-tanzu/vm-operator/api"
+	vmopv1 "github.com/vmware-tanzu/vm-operator/api/v1alpha6"
 	pkgcfg "github.com/vmware-tanzu/vm-operator/pkg/config"
 	pkgctx "github.com/vmware-tanzu/vm-operator/pkg/context"
+	"github.com/vmware-tanzu/vm-operator/pkg/multivc"
 	"github.com/vmware-tanzu/vm-operator/pkg/record"
 )
 
@@ -96,6 +98,20 @@ func New(ctx context.Context, opts Options) (Manager, error) {
 		_ = vpcv1alpha1.AddToScheme(opts.Scheme)
 	}
 
+	// A multi-vCenter shard caches only the VMs in its zones. Everything that
+	// reads VMs through the manager's client, controllers included, sees only
+	// those VMs.
+	vmSelector, err := multivc.VMSelector(pkgcfg.FromContext(ctx).MultiVC)
+	if err != nil {
+		return nil, err
+	}
+	var byObject map[client.Object]cache.ByObject
+	if !vmSelector.Empty() {
+		byObject = map[client.Object]cache.ByObject{
+			&vmopv1.VirtualMachine{}: {Label: vmSelector},
+		}
+	}
+
 	// Build the controller manager.
 	mgr, err := ctrlmgr.New(opts.KubeConfig, ctrlmgr.Options{
 		Scheme: opts.Scheme,
@@ -103,6 +119,7 @@ func New(ctx context.Context, opts Options) (Manager, error) {
 			DefaultNamespaces: GetNamespaceCacheConfigs(opts.WatchNamespace),
 			DefaultTransform:  cache.TransformStripManagedFields(),
 			SyncPeriod:        &opts.SyncPeriod,
+			ByObject:          byObject,
 		},
 		Client: client.Options{
 			Cache: &client.CacheOptions{
