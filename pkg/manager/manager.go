@@ -111,6 +111,17 @@ func New(ctx context.Context, opts Options) (Manager, error) {
 			&vmopv1.VirtualMachine{}: {Label: vmSelector},
 		}
 	}
+	if pkgcfg.FromContext(ctx).MultiVC.IsGlobal() {
+		if byObject == nil {
+			byObject = make(map[client.Object]cache.ByObject)
+		}
+		// The shard controller watches Deployments in the pod namespace.
+		// Scope its informer before LIST/WATCH, since the global process has
+		// only namespace-scoped Deployment permissions.
+		byObject[&appsv1.Deployment{}] = cache.ByObject{
+			Namespaces: GetNamespaceCacheConfigs(opts.PodNamespace),
+		}
+	}
 
 	// Build the controller manager.
 	mgr, err := ctrlmgr.New(opts.KubeConfig, ctrlmgr.Options{
@@ -136,9 +147,8 @@ func New(ctx context.Context, opts Options) (Manager, error) {
 					// in order to patch it to restart the pods in the
 					// deployment when capabilities have changed.
 					// Capabilities do not change often enough to warrant
-					// caching the Deployment resource, and thus there is no
-					// reason to cache Deployment resources as nothing else in
-					// VM Operator gets them.
+					// caching Deployment reads. The shard controller's explicit
+					// watch still creates an informer, scoped above in global mode.
 					&appsv1.Deployment{},
 				},
 			},

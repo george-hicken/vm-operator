@@ -3,6 +3,8 @@
 # The global process (VMOP_MULTIVC_MODE=global) renders one shard Deployment
 # and one credential SecretTemplate per SDDC in its own namespace, and reads
 # SDDCs. The shards run as the same service account and read their SDDC.
+# Its Deployment informer watches only the VM Operator pod namespace, so this
+# namespaced Role covers both the shard controller's watch and its writes.
 #
 # Append these documents to vmop.yaml. The namespace and service account are
 # those of the Supervisor's vmop.yaml.
