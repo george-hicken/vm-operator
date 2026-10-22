@@ -17,6 +17,7 @@ import (
 
 	pkgcfg "github.com/vmware-tanzu/vm-operator/pkg/config"
 	pkglog "github.com/vmware-tanzu/vm-operator/pkg/log"
+	"github.com/vmware-tanzu/vm-operator/pkg/multivc"
 	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/credentials"
 )
 
@@ -31,6 +32,15 @@ type VSphereVMProviderConfig struct {
 	UseInventoryAsContentSource bool // Always false in WCP env.
 	CAFilePath                  string
 	InsecureSkipTLSVerify       bool // Always false in WCP env.
+
+	// CAPEM is the PEM-encoded CA bundle of a multi-vCenter shard's SDDC.
+	// It is used only when CAFilePath is empty.
+	CAPEM string
+
+	// VCenterUUID is the instance UUID the vCenter must report. It is set for
+	// a multi-vCenter shard, whose endpoint comes from its SDDC, and empty
+	// otherwise.
+	VCenterUUID string
 
 	// Only set in simulated testing env.
 	Datastore string
@@ -169,10 +179,24 @@ func getProviderConfigMap(
 	return configMap, nil
 }
 
+// ErrNoVCClient is returned when a VM Operator process in the multi-vCenter
+// global mode asks for a vCenter client. The global mode has none.
+var ErrNoVCClient = errors.New("the multi-vCenter global mode has no vCenter client")
+
 // GetProviderConfig returns a provider config constructed from vSphere Provider ConfigMap in the VM Operator namespace.
+//
+// In the multi-vCenter shard mode, the vCenter endpoint, CA bundle, datacenter
+// and instance UUID come from the shard's SDDC instead, and the credentials
+// from the shard's VC_CREDS_SECRET_NAME Secret. The other settings still come
+// from the ConfigMap. In the global mode it returns ErrNoVCClient.
 func GetProviderConfig(
 	ctx context.Context,
 	client ctrlclient.Client) (*VSphereVMProviderConfig, error) {
+
+	multiVC := pkgcfg.FromContext(ctx).MultiVC
+	if !multiVC.HasVCClient() {
+		return nil, ErrNoVCClient
+	}
 
 	configMap, err := getProviderConfigMap(ctx, client)
 	if err != nil {
@@ -193,7 +217,50 @@ func GetProviderConfig(
 		return nil, err
 	}
 
+	if multiVC.IsShard() {
+		if err := applyShardSDDC(ctx, client, multiVC.ShardSDDC, providerConfig); err != nil {
+			return nil, err
+		}
+	}
+
 	return providerConfig, nil
+}
+
+// applyShardSDDC sets the vCenter endpoint, trust, datacenter and identity of
+// the named SDDC in providerConfig.
+func applyShardSDDC(
+	ctx context.Context,
+	client ctrlclient.Client,
+	sddcName string,
+	providerConfig *VSphereVMProviderConfig) error {
+
+	obj := multivc.NewSDDC()
+	if err := client.Get(ctx, ctrlclient.ObjectKey{Name: sddcName}, obj); err != nil {
+		return fmt.Errorf("error retrieving the shard SDDC %q: %w", sddcName, err)
+	}
+	sddc := multivc.SDDCFromUnstructured(obj)
+
+	host, port, err := sddc.Endpoint()
+	if err != nil {
+		return err
+	}
+	if sddc.VCenterUUID == "" {
+		return fmt.Errorf("shard SDDC %q has no %s annotation", sddcName, multivc.AnnotationVCenterUUID)
+	}
+	if sddc.Datacenter == "" {
+		return fmt.Errorf("shard SDDC %q has no %s annotation", sddcName, multivc.AnnotationDatacenter)
+	}
+
+	providerConfig.VcPNID = host
+	providerConfig.VcPort = port
+	providerConfig.Datacenter = sddc.Datacenter
+	providerConfig.VCenterUUID = sddc.VCenterUUID
+	// The SDDC's trust bundle replaces the ConfigMap's CA file, which is the
+	// primary vCenter's. An SDDC without a bundle uses the system roots.
+	providerConfig.CAFilePath = ""
+	providerConfig.CAPEM = sddc.TrustBundle
+
+	return nil
 }
 
 // ProviderConfigToConfigMap returns the ConfigMap for the config.

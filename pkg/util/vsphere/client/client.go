@@ -6,6 +6,8 @@ package client
 
 import (
 	"context"
+	"crypto/x509"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -32,6 +34,9 @@ type Config struct {
 	Username   string
 	Password   string
 	CAFilePath string
+	// CAPEM is a PEM-encoded CA bundle that the vCenter certificate is
+	// verified against. It is used only when CAFilePath is empty.
+	CAPEM      string
 	Insecure   bool
 	Datacenter string
 }
@@ -186,12 +191,19 @@ func NewVimClient(
 	}
 
 	soapClient := soap.NewClient(soapURL, config.Insecure)
-	if config.CAFilePath != "" {
+	switch {
+	case config.CAFilePath != "":
 		err = soapClient.SetRootCAs(config.CAFilePath)
 		if err != nil {
 			return nil, nil, fmt.Errorf(
 				"failed to set root CA %s: %w", config.CAFilePath, err)
 		}
+	case config.CAPEM != "":
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM([]byte(config.CAPEM)) {
+			return nil, nil, errors.New("failed to set root CA: no certificate in the CA bundle")
+		}
+		soapClient.DefaultTransport().TLSClientConfig.RootCAs = pool
 	}
 
 	vimClient, err := vim25.NewClient(ctx, soapClient)
