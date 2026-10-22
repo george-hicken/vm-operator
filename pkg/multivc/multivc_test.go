@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -453,6 +455,82 @@ var _ = Describe("Resource policy shard status", Label(testlabels.API), func() {
 			vmopv1.VSphereClusterModuleStatus{ClusterMoID: "vc-3/domain-c1", GroupName: "cp", ModuleUuid: "module-vc3"},
 		))
 		Expect(second.Status.ClusterModules[0].ModuleUuid).To(Equal("already-created-module-vc2"))
+	})
+
+	It("Should converge alternating provider rebuilds without further status writes", func() {
+		setEntries(policy, "vc-2", "module-vc2")
+		setEntries(policy, "vc-1", "module-vc1")
+		extraModule := vmopv1.VSphereClusterModuleStatus{
+			ClusterMoID: "vc-1/domain-c1", GroupName: "worker", ModuleUuid: "worker-module-vc1",
+		}
+		policy.Status.ClusterModules = append(policy.Status.ClusterModules, extraModule)
+		patches := 0
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(policy).
+			WithStatusSubresource(policy).
+			WithInterceptorFuncs(interceptor.Funcs{
+				SubResourcePatch: func(ctx context.Context, c ctrlclient.Client, subresource string,
+					obj ctrlclient.Object, patch ctrlclient.Patch, opts ...ctrlclient.SubResourcePatchOption) error {
+					patches++
+					return c.SubResource(subresource).Patch(ctx, obj, patch, opts...)
+				},
+			}).Build()
+		key := ctrlclient.ObjectKeyFromObject(policy)
+		reconcile := func(sddc, pool, module string) {
+			before := &vmopv1.VirtualMachineSetResourcePolicy{}
+			Expect(c.Get(ctx, key, before)).To(Succeed())
+			after := before.DeepCopy()
+			// The provider rebuilds its own entries even when VC state is unchanged.
+			after.Status.ResourcePools = slices.DeleteFunc(after.Status.ResourcePools,
+				func(entry vmopv1.ResourcePoolStatus) bool {
+					return strings.HasPrefix(entry.ClusterMoID, sddc+"/")
+				})
+			after.Status.ClusterModules = slices.DeleteFunc(after.Status.ClusterModules,
+				func(entry vmopv1.VSphereClusterModuleStatus) bool {
+					return strings.HasPrefix(entry.ClusterMoID, sddc+"/")
+				})
+			if module != "" {
+				if sddc == "vc-1" {
+					after.Status.ClusterModules = append(after.Status.ClusterModules, extraModule)
+				}
+				setEntries(after, sddc, module)
+				after.Status.ResourcePools[len(after.Status.ResourcePools)-1].ChildResourcePoolMoID = pool
+			}
+			Expect(multivc.PatchResourcePolicyStatus(shardContext(sddc), c, c, before, after)).To(Succeed())
+		}
+		reconcile("vc-1", "resgroup-vc-1", "module-vc1")
+		reconcile("vc-2", "resgroup-vc-2", "module-vc2")
+		converged := &vmopv1.VirtualMachineSetResourcePolicy{}
+		Expect(c.Get(ctx, key, converged)).To(Succeed())
+		Expect(converged.Status.ClusterModules).To(Equal([]vmopv1.VSphereClusterModuleStatus{
+			policy.Status.ClusterModules[1], extraModule, policy.Status.ClusterModules[0],
+		}))
+		patchesAtConvergence := patches
+		for range 3 {
+			reconcile("vc-1", "resgroup-vc-1", "module-vc1")
+			reconcile("vc-2", "resgroup-vc-2", "module-vc2")
+		}
+		latest := &vmopv1.VirtualMachineSetResourcePolicy{}
+		Expect(c.Get(ctx, key, latest)).To(Succeed())
+		Expect(patches).To(Equal(patchesAtConvergence))
+		Expect(latest.ResourceVersion).To(Equal(converged.ResourceVersion))
+		Expect(latest.Status).To(Equal(converged.Status))
+
+		reconcile("vc-1", "new-pool-vc1", "new-module-vc1")
+		Expect(c.Get(ctx, key, latest)).To(Succeed())
+		Expect(patches).To(Equal(patchesAtConvergence + 1))
+		Expect(latest.Status.ResourcePools).To(ConsistOf(
+			vmopv1.ResourcePoolStatus{ClusterMoID: "vc-1/domain-c1", ChildResourcePoolMoID: "new-pool-vc1"},
+			policy.Status.ResourcePools[0],
+		))
+		Expect(latest.Status.ClusterModules).To(ConsistOf(
+			vmopv1.VSphereClusterModuleStatus{ClusterMoID: "vc-1/domain-c1", GroupName: "cp", ModuleUuid: "new-module-vc1"},
+			extraModule, policy.Status.ClusterModules[0],
+		))
+		reconcile("vc-1", "", "")
+		Expect(c.Get(ctx, key, latest)).To(Succeed())
+		Expect(patches).To(Equal(patchesAtConvergence + 2))
+		Expect(latest.Status.ResourcePools).To(ConsistOf(policy.Status.ResourcePools[0]))
+		Expect(latest.Status.ClusterModules).To(ConsistOf(policy.Status.ClusterModules[0]))
 	})
 
 	It("Should remove only the deleting shard's entries and preserve newer foreign entries", func() {
