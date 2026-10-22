@@ -10,6 +10,7 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -28,16 +29,26 @@ import (
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlmgr "sigs.k8s.io/controller-runtime/pkg/manager"
 
+	imgregv1 "github.com/vmware-tanzu/image-registry-operator-api/api/v1alpha2"
+
 	vmopv1 "github.com/vmware-tanzu/vm-operator/api/v1alpha6"
+	"github.com/vmware-tanzu/vm-operator/controllers/virtualmachine/virtualmachine"
 	"github.com/vmware-tanzu/vm-operator/controllers/virtualmachineimagecache"
 	"github.com/vmware-tanzu/vm-operator/controllers/virtualmachineimagecache/internal"
 	pkgcond "github.com/vmware-tanzu/vm-operator/pkg/conditions"
 	pkgcfg "github.com/vmware-tanzu/vm-operator/pkg/config"
+	pkgconst "github.com/vmware-tanzu/vm-operator/pkg/constants"
 	"github.com/vmware-tanzu/vm-operator/pkg/constants/testlabels"
 	pkgctx "github.com/vmware-tanzu/vm-operator/pkg/context"
+	pkgerr "github.com/vmware-tanzu/vm-operator/pkg/errors"
+	"github.com/vmware-tanzu/vm-operator/pkg/providers"
 	providerfake "github.com/vmware-tanzu/vm-operator/pkg/providers/fake"
+	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere"
 	clprov "github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/contentlibrary"
+	pkgutil "github.com/vmware-tanzu/vm-operator/pkg/util"
 	"github.com/vmware-tanzu/vm-operator/pkg/util/kube/cource"
+	"github.com/vmware-tanzu/vm-operator/pkg/util/ovfcache"
+	"github.com/vmware-tanzu/vm-operator/pkg/util/ptr"
 	vsclient "github.com/vmware-tanzu/vm-operator/pkg/util/vsphere/client"
 	clsutil "github.com/vmware-tanzu/vm-operator/pkg/util/vsphere/library"
 	"github.com/vmware-tanzu/vm-operator/test/builder"
@@ -1354,3 +1365,107 @@ func (m *fakeClient) CreateLibraryItem(
 	}
 	return nil
 }
+
+var _ = Describe("Local image cache recovery", Label(testlabels.Controller, testlabels.EnvTest, testlabels.VCSim), func() {
+	It("reconciles local hardware and wakes a pre-labelled VM while leaving foreign caches alone", func() {
+		parent := cource.WithContext(ovfcache.WithContext(pkgcfg.NewContextWithDefaultConfig()))
+		pkgcfg.SetContext(parent, func(config *pkgcfg.Config) {
+			config.Features.FastDeploy = true
+			config.Features.InventoryContentLibrary = true
+			config.AsyncCreateEnabled = false
+			config.AsyncSignalEnabled = false
+			config.MultiVC = pkgcfg.MultiVC{Mode: pkgcfg.MultiVCModeShard, ShardSDDC: "local", OwnedZones: "az-0"}
+		})
+		source := builder.NewTestContextForVCSim(
+			cource.WithContext(ovfcache.WithContext(pkgcfg.NewContextWithDefaultConfig())),
+			builder.VCSimTestConfig{WithContentLibrary: true})
+		defer source.AfterEach()
+		var local *builder.IntegrationTestContextForVCSim
+		var sourceCache, localCache vmopv1.VirtualMachineImageCache
+		var vm *vmopv1.VirtualMachine
+		var operations atomic.Int32
+		var realProvider providers.VirtualMachineProviderInterface
+		fakeProvider := providerfake.NewVMProvider()
+		previousNameValidation := virtualmachine.SkipNameValidation
+		DeferCleanup(func() { virtualmachine.SkipNameValidation = previousNameValidation })
+		virtualmachine.SkipNameValidation = ptr.To(true)
+		local = builder.NewIntegrationTestContextForVCSim(parent,
+			builder.VCSimTestConfig{WithContentLibrary: true},
+			func(ctx *pkgctx.ControllerManagerContext, mgr ctrlmgr.Manager) error {
+				if err := virtualmachineimagecache.AddToManager(ctx, mgr); err != nil {
+					return err
+				}
+				return virtualmachine.AddToManager(ctx, mgr)
+			},
+			func(ctx *pkgctx.ControllerManagerContext, mgr ctrlmgr.Manager) error {
+				realProvider = vsphere.NewVSphereVMProviderFromClient(ctx, mgr.GetClient(), ctx.Recorder)
+				fakeProvider.EnsureVirtualMachineImageCacheFn = realProvider.EnsureVirtualMachineImageCache
+				fakeProvider.VSphereClientFn = func(ctx context.Context) (*vsclient.Client, error) {
+					return vsclient.NewClient(ctx, local.VCClientConfig)
+				}
+				fakeProvider.CreateOrUpdateVirtualMachineFn = func(ctx context.Context, _ *vmopv1.VirtualMachine) error {
+					var got vmopv1.VirtualMachineImageCache
+					if err := mgr.GetClient().Get(ctx, ctrlclient.ObjectKeyFromObject(&localCache), &got); err != nil {
+						return err
+					}
+					if pkgcond.IsTrue(got, vmopv1.VirtualMachineImageCacheConditionHardwareReady) {
+						operations.Add(1)
+					}
+					return pkgerr.NoRequeueError{Message: "hardware prerequisite observed"}
+				}
+				ctx.VMProvider = fakeProvider
+				return nil
+			},
+			func(ctx *builder.IntegrationTestContextForVCSim) {
+				connectionConfig := pkgcfg.FromContext(ctx)
+				connectionConfig.MultiVC = pkgcfg.MultiVC{}
+				_, err := realProvider.VSphereClient(pkgcfg.WithContext(ctx, connectionConfig))
+				Expect(err).ToNot(HaveOccurred())
+				mgr := library.NewManager(ctx.RestClient)
+				Expect(mgr.UpdateLibraryItem(ctx, &library.Item{ID: ctx.ContentLibraryItem1ID, Name: "local-cache-image"})).To(Succeed())
+				var image vmopv1.ClusterVirtualMachineImage
+				Expect(ctx.Client.Get(ctx, ctrlclient.ObjectKey{Name: ctx.ContentLibraryItem1Name}, &image)).To(Succeed())
+				itemRef := &imgregv1.ClusterContentLibraryItem{
+					ObjectMeta: metav1.ObjectMeta{Name: "source-library-item"},
+					Spec:       imgregv1.ContentLibraryItemSpec{ID: source.ContentLibraryItem1ID, LibraryName: "source-library"},
+				}
+				Expect(ctx.Client.Create(ctx, itemRef)).To(Succeed())
+				image.Spec.ProviderRef.Name = itemRef.Name
+				Expect(ctx.Client.Update(ctx, &image)).To(Succeed())
+				image.Status.ProviderItemID = source.ContentLibraryItem1ID
+				image.Status.ProviderContentVersion = "source-version"
+				image.Status.Name = "local-cache-image"
+				Expect(ctx.Client.Status().Update(ctx, &image)).To(Succeed())
+				sourceCache = vmopv1.VirtualMachineImageCache{
+					ObjectMeta: metav1.ObjectMeta{Namespace: ctx.PodNamespace, Name: pkgutil.VMIName(source.ContentLibraryItem1ID)},
+					Spec:       vmopv1.VirtualMachineImageCacheSpec{ProviderID: source.ContentLibraryItem1ID, ProviderVersion: "source-version"},
+				}
+				Expect(ctx.Client.Create(ctx, &sourceCache)).To(Succeed())
+				localCache = vmopv1.VirtualMachineImageCache{ObjectMeta: metav1.ObjectMeta{Namespace: ctx.PodNamespace, Name: pkgutil.VMIName(ctx.ContentLibraryItem1ID)}}
+				vm = builder.DummyBasicVirtualMachine("waiting-local-cache", ctx.NSInfo.Namespace)
+				vm.Spec.StorageClass = ctx.StorageClassName
+				vm.Spec.ImageName = image.Name
+				vm.Spec.Image.Kind = "ClusterVirtualMachineImage"
+				vm.Spec.Image.Name = image.Name
+				vm.Labels[corev1.LabelTopologyZone] = ctx.GetFirstZoneName()
+				vm.Labels[pkgconst.VMICacheLabelKey] = localCache.Name
+				Expect(ctx.Client.Create(ctx, vm)).To(Succeed())
+			})
+		local.BeforeEach()
+		defer local.AfterEach()
+		Eventually(func(g Gomega) {
+			g.Expect(local.Client.Get(local, ctrlclient.ObjectKeyFromObject(&localCache), &localCache)).To(Succeed())
+			g.Expect(pkgcond.IsTrue(localCache, vmopv1.VirtualMachineImageCacheConditionHardwareReady)).To(BeTrue())
+			g.Expect(localCache.Spec.ProviderID).To(Equal(local.ContentLibraryItem1ID))
+			g.Expect(localCache.Spec.ProviderVersion).To(Equal(local.ContentLibraryItem1Version))
+			g.Expect(localCache.Status.OVF).ToNot(BeNil())
+			g.Expect(localCache.Status.OVF.ProviderVersion).To(Equal(local.ContentLibraryItem1Version))
+		}).WithTimeout(30 * time.Second).Should(Succeed())
+		Eventually(operations.Load).WithTimeout(30 * time.Second).Should(BeNumerically(">", 0))
+		Consistently(func(g Gomega) {
+			var got vmopv1.VirtualMachineImageCache
+			g.Expect(local.Client.Get(local, ctrlclient.ObjectKeyFromObject(&sourceCache), &got)).To(Succeed())
+			g.Expect(got).To(Equal(sourceCache))
+		}).WithTimeout(30 * time.Second).Should(Succeed())
+	})
+})
