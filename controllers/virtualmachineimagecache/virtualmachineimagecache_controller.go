@@ -39,6 +39,7 @@ import (
 	pkgctx "github.com/vmware-tanzu/vm-operator/pkg/context"
 	pkgerr "github.com/vmware-tanzu/vm-operator/pkg/errors"
 	pkglog "github.com/vmware-tanzu/vm-operator/pkg/log"
+	"github.com/vmware-tanzu/vm-operator/pkg/multivc"
 	"github.com/vmware-tanzu/vm-operator/pkg/patch"
 	"github.com/vmware-tanzu/vm-operator/pkg/providers"
 	clprov "github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/contentlibrary"
@@ -110,6 +111,27 @@ func (r *reconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Re
 	var obj vmopv1.VirtualMachineImageCache
 	if err := r.Get(ctx, req.NamespacedName, &obj); err != nil {
 		return ctrl.Result{}, ctrlclient.IgnoreNotFound(err)
+	}
+
+	// A multi-vCenter shard caches the items that are in its own vCenter.
+	if obj.DeletionTimestamp.IsZero() {
+		skip, err := multivc.SkipLibraryItem(
+			ctx,
+			pkgcfg.FromContext(ctx).MultiVC,
+			func(ctx context.Context) (*rest.Client, error) {
+				c, err := r.VMProvider.VSphereClient(ctx)
+				if err != nil {
+					return nil, err
+				}
+				return c.RestClient(), nil
+			},
+			obj.Spec.ProviderID)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if skip {
+			return ctrl.Result{}, nil
+		}
 	}
 
 	patchHelper, err := patch.NewHelper(&obj, r.Client)

@@ -15,15 +15,31 @@ import (
 	"github.com/vmware-tanzu/vm-operator/controllers/virtualmachine/volumebatch"
 	pkgcfg "github.com/vmware-tanzu/vm-operator/pkg/config"
 	pkgctx "github.com/vmware-tanzu/vm-operator/pkg/context"
+	"github.com/vmware-tanzu/vm-operator/pkg/multivc"
 )
 
 // AddToManager adds the controllers to the provided manager.
+// AddToManager adds the controllers to the provided manager.
+//
+// In a multi-vCenter deployment, the VirtualMachine and volume controllers
+// realize VMs in a vCenter, so they run in every shard, each for the VMs in
+// its cache. The StoragePolicyUsage controller sums usage over all VMs and
+// needs no vCenter client, so it runs in the global process.
 func AddToManager(ctx *pkgctx.ControllerManagerContext, mgr manager.Manager) error {
+	multiVC := pkgcfg.FromContext(ctx).MultiVC
+
+	if multivc.Runs(multiVC, multivc.PartGlobal) {
+		if err := storagepolicyusage.AddToManager(ctx, mgr); err != nil {
+			return fmt.Errorf("failed to initialize virtualmachine storagepolicyusage controller: %w", err)
+		}
+	}
+
+	if !multivc.Runs(multiVC, multivc.PartShard) {
+		return nil
+	}
+
 	if err := virtualmachine.AddToManager(ctx, mgr); err != nil {
 		return fmt.Errorf("failed to initialize virtualmachine controller: %w", err)
-	}
-	if err := storagepolicyusage.AddToManager(ctx, mgr); err != nil {
-		return fmt.Errorf("failed to initialize virtualmachine storagepolicyusage controller: %w", err)
 	}
 
 	if pkgcfg.FromContext(ctx).Features.VMSharedDisks {

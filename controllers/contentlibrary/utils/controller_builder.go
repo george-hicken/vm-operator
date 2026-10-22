@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/go-logr/logr"
+	"github.com/vmware/govmomi/vapi/rest"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -29,6 +30,7 @@ import (
 	pkgctx "github.com/vmware-tanzu/vm-operator/pkg/context"
 	pkgerr "github.com/vmware-tanzu/vm-operator/pkg/errors"
 	pkglog "github.com/vmware-tanzu/vm-operator/pkg/log"
+	"github.com/vmware-tanzu/vm-operator/pkg/multivc"
 	"github.com/vmware-tanzu/vm-operator/pkg/patch"
 	"github.com/vmware-tanzu/vm-operator/pkg/providers"
 	"github.com/vmware-tanzu/vm-operator/pkg/record"
@@ -152,6 +154,16 @@ func (r *Reconciler) Reconcile(
 		return ctrl.Result{}, nil
 	}
 	logger = logger.WithValues("vmiName", vmiName)
+
+	if obj.GetDeletionTimestamp().IsZero() {
+		skip, err := skipLibraryItem(ctx, r.VMProvider, string(spec.UUID))
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if skip {
+			return ctrl.Result{}, nil
+		}
+	}
 
 	patchHelper, err := patch.NewHelper(obj, r.Client)
 	if err != nil {
@@ -518,4 +530,25 @@ func GetAppropriateFinalizers(obj client.Object) (string, string) {
 		return CLItemFinalizer, DeprecatedCLItemFinalizer
 	}
 	return CCLItemFinalizer, DeprecatedCCLItemFinalizer
+}
+
+// skipLibraryItem returns true when another multi-vCenter shard is
+// responsible for the library item, because the item is not in this shard's
+// vCenter.
+func skipLibraryItem(
+	ctx context.Context,
+	vmProvider providers.VirtualMachineProviderInterface,
+	itemID string) (bool, error) {
+
+	return multivc.SkipLibraryItem(
+		ctx,
+		pkgcfg.FromContext(ctx).MultiVC,
+		func(ctx context.Context) (*rest.Client, error) {
+			c, err := vmProvider.VSphereClient(ctx)
+			if err != nil {
+				return nil, err
+			}
+			return c.RestClient(), nil
+		},
+		itemID)
 }
