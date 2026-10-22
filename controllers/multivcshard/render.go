@@ -48,8 +48,9 @@ const (
 
 	// VM Operator pods use the host network, so each shard on a node needs
 	// its own ports. Shard i binds healthPortBase+i and metricsPortBase+i.
-	healthPortBase  = 9460
-	metricsPortBase = 9900
+	// Keep both ranges clear of observed stock Supervisor listeners.
+	healthPortBase  = 18000
+	metricsPortBase = 18100
 
 	// MaxShards is the number of shards the port ranges allow.
 	MaxShards = 100

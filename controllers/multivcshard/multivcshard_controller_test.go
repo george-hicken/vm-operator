@@ -7,6 +7,7 @@ package multivcshard_test
 import (
 	"context"
 	"errors"
+	"strconv"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -18,6 +19,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -66,6 +68,12 @@ func globalDeployment() *appsv1.Deployment {
 							{Name: "health-probe", ContainerPort: 9445},
 							{Name: "metrics-server", ContainerPort: 9848},
 						},
+						LivenessProbe: &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
+							Path: "/healthz", Port: intstr.FromString("health-probe"),
+						}}},
+						ReadinessProbe: &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
+							Path: "/readyz", Port: intstr.FromString("health-probe"),
+						}}},
 						VolumeMounts: []corev1.VolumeMount{
 							{Name: "vmca-certs", MountPath: "/etc/vmware/wcp/tls"},
 							{Name: "cert", MountPath: webhookCertDir},
@@ -141,10 +149,10 @@ var _ = Describe("RenderDeployment", Label(testlabels.Controller), func() {
 		Expect(envOf(c, "VC_CREDS_SECRET_NAME")).To(Equal("wcp-vmop-sa-vc-auth-vc-2"))
 		Expect(envOf(c, "DEPLOYMENT_NAME")).To(Equal(d.Name))
 		Expect(envOf(c, "LEADER_ELECTION_ID")).To(Equal("vmop"))
-		Expect(c.Args).To(ConsistOf("--metrics-addr=:9901", "--health-addr=:9461", "--profiler-address=0"))
+		Expect(c.Args).To(ConsistOf("--metrics-addr=:18101", "--health-addr=:18001", "--profiler-address=0"))
 		Expect(c.Ports).To(ConsistOf(
-			corev1.ContainerPort{Name: "health-probe", ContainerPort: 9461},
-			corev1.ContainerPort{Name: "metrics-server", ContainerPort: 9901}))
+			corev1.ContainerPort{Name: "health-probe", ContainerPort: 18001},
+			corev1.ContainerPort{Name: "metrics-server", ContainerPort: 18101}))
 		Expect(c.VolumeMounts).To(ConsistOf(corev1.VolumeMount{Name: "vmca-certs", MountPath: "/etc/vmware/wcp/tls"}))
 		Expect(d.Spec.Template.Spec.Volumes).To(ConsistOf(corev1.Volume{Name: "vmca-certs"}))
 	})
@@ -156,6 +164,41 @@ var _ = Describe("RenderDeployment", Label(testlabels.Controller), func() {
 		Expect(a.Annotations[multivcshard.SpecHashAnnotationKey]).ToNot(Equal(b.Annotations[multivcshard.SpecHashAnnotationKey]))
 		_, err = multivcshard.RenderDeployment(globalDeployment(), "vc-1", multivcshard.MaxShards, testConfig())
 		Expect(err).To(HaveOccurred())
+	})
+	It("Should keep all shard listeners clear of observed stock host ports", func() {
+		// Representative host ports from the run121 pod snapshot include the
+		// runtime extension's 9460 health port and a separate 18312 webhook.
+		stockHostPorts := map[int32]bool{
+			9442: true, 9460: true, 9876: true, 18312: true,
+			9445: true, 9848: true, 9878: true,
+		}
+		used := map[int32]bool{}
+		for i := range multivcshard.MaxShards {
+			d, err := multivcshard.RenderDeployment(globalDeployment(), "vc-1", i, testConfig())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(d.Spec.Strategy.Type).To(Equal(appsv1.RecreateDeploymentStrategyType))
+			Expect(d.Annotations[multivcshard.PortIndexAnnotationKey]).To(Equal(strconv.Itoa(i)))
+			c := d.Spec.Template.Spec.Containers[0]
+			Expect(c.Ports).To(HaveLen(2))
+			ports := map[string]int32{}
+			for _, p := range c.Ports {
+				Expect(p.ContainerPort).To(BeNumerically(">", 0))
+				Expect(p.ContainerPort).To(BeNumerically("<=", 65535))
+				Expect(stockHostPorts).ToNot(HaveKey(p.ContainerPort))
+				Expect(used).ToNot(HaveKey(p.ContainerPort))
+				used[p.ContainerPort] = true
+				ports[p.Name] = p.ContainerPort
+			}
+			Expect(ports).To(HaveKey("health-probe"))
+			Expect(ports).To(HaveKey("metrics-server"))
+			Expect(c.Args).To(ContainElement("--health-addr=:" + strconv.Itoa(int(ports["health-probe"]))))
+			Expect(c.Args).To(ContainElement("--metrics-addr=:" + strconv.Itoa(int(ports["metrics-server"]))))
+			Expect(c.Args).To(ContainElement("--profiler-address=0"))
+			Expect(c.LivenessProbe.HTTPGet.Port).To(Equal(intstr.FromString("health-probe")))
+			Expect(c.ReadinessProbe.HTTPGet.Port).To(Equal(intstr.FromString("health-probe")))
+			Expect(ports).ToNot(HaveKey("webhook-server"))
+		}
+		Expect(used).To(HaveLen(2 * multivcshard.MaxShards))
 	})
 })
 
@@ -231,6 +274,14 @@ var _ = Describe("Reconcile", Label(testlabels.Controller), func() {
 		Expect(err).ToNot(HaveOccurred())
 		Expect(after.ResourceVersion).To(Equal(before.ResourceVersion))
 		Expect(after.Annotations[multivcshard.PortIndexAnnotationKey]).To(Equal("0"))
+
+		Expect(client.Delete(ctx, newSDDC("vc-1"))).To(Succeed())
+		reconcile("vc-1")
+		reconcile("vc-2")
+		afterRemoval, err := getShard("vc-2")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(afterRemoval.ResourceVersion).To(Equal(before.ResourceVersion))
+		Expect(afterRemoval.Annotations[multivcshard.PortIndexAnnotationKey]).To(Equal("0"))
 	})
 	It("Should delete the shard when its SDDC is gone", func() {
 		reconcile("vc-2")
