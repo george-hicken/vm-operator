@@ -70,6 +70,11 @@ type VirtualMachineProviderInterface interface {
 	UpdateContentLibraryItem(ctx context.Context, itemID, newName string, newDescription *string) error
 	SyncVirtualMachineImage(ctx context.Context, cli, vmi ctrlclient.Object) error
 
+	// EnsureVirtualMachineImageCache restores a missing cache prerequisite after
+	// validating the VM's image and local provider identity. It never creates or
+	// updates a vSphere VM, or marks the image cache ready.
+	EnsureVirtualMachineImageCache(ctx context.Context, vm *vmopv1.VirtualMachine) error
+
 	GetTasksByActID(ctx context.Context, vm *vmopv1.VirtualMachine, actID string) (tasksInfo []vimtypes.TaskInfo, retErr error)
 
 	// DoesProfileSupportEncryption returns true if the specified profile

@@ -273,24 +273,9 @@ func (vs *vSphereVMProvider) syncVirtualMachineImageFastDeploy(
 	itemID,
 	itemVersion string) error {
 
-	// Create or patch the VMICache object.
-	vmiCache := vmopv1.VirtualMachineImageCache{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: pkgcfg.FromContext(ctx).PodNamespace,
-			Name:      pkgutil.VMIName(itemID),
-		},
-	}
-	if _, err := controllerutil.CreateOrPatch(
-		ctx,
-		vs.k8sClient,
-		&vmiCache,
-		func() error {
-			vmiCache.Spec.ProviderID = itemID
-			vmiCache.Spec.ProviderVersion = itemVersion
-			return nil
-		}); err != nil {
-		return fmt.Errorf(
-			"failed to createOrPatch image cache resource: %w", err)
+	vmiCache, err := vs.ensureImageCache(ctx, itemID, itemVersion)
+	if err != nil {
+		return err
 	}
 
 	hardwareReadyCondition := pkgcond.Get(
@@ -329,6 +314,28 @@ func (vs *vSphereVMProvider) syncVirtualMachineImageFastDeploy(
 		itemVersion,
 		logger,
 		vmi)
+}
+
+// ensureImageCache initializes hardware caching without changing readiness or
+// existing datastore locations. The cache controller owns the cached content.
+func (vs *vSphereVMProvider) ensureImageCache(
+	ctx context.Context,
+	itemID, itemVersion string) (vmopv1.VirtualMachineImageCache, error) {
+
+	obj := vmopv1.VirtualMachineImageCache{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: pkgcfg.FromContext(ctx).PodNamespace,
+			Name:      pkgutil.VMIName(itemID),
+		},
+	}
+	if _, err := controllerutil.CreateOrPatch(ctx, vs.k8sClient, &obj, func() error {
+		obj.Spec.ProviderID = itemID
+		obj.Spec.ProviderVersion = itemVersion
+		return nil
+	}); err != nil {
+		return obj, fmt.Errorf("failed to createOrPatch image cache resource: %w", err)
+	}
+	return obj, nil
 }
 
 func (vs *vSphereVMProvider) syncVirtualMachineImageFastDeployOVF(

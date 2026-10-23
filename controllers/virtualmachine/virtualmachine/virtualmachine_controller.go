@@ -14,6 +14,7 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -39,6 +40,7 @@ import (
 	ctxop "github.com/vmware-tanzu/vm-operator/pkg/context/operation"
 	pkgerr "github.com/vmware-tanzu/vm-operator/pkg/errors"
 	pkglog "github.com/vmware-tanzu/vm-operator/pkg/log"
+	"github.com/vmware-tanzu/vm-operator/pkg/multivc"
 	"github.com/vmware-tanzu/vm-operator/pkg/patch"
 	"github.com/vmware-tanzu/vm-operator/pkg/prober"
 	"github.com/vmware-tanzu/vm-operator/pkg/providers"
@@ -638,7 +640,11 @@ func (r *Reconciler) ReconcileNormal(ctx *pkgctx.VirtualMachineContext) (reterr 
 
 	if pkgcfg.FromContext(ctx).Features.FastDeploy {
 		// Do not proceed unless the VMI cache this VM needs is ready.
-		if !r.isVMICacheReady(ctx) {
+		ready, err := r.isVMICacheReady(ctx)
+		if err != nil {
+			return err
+		}
+		if !ready {
 			return pkgerr.NoRequeueError{Message: "disk image cache is not ready"}
 		}
 	}
@@ -758,11 +764,11 @@ func (r *Reconciler) handleNonBlockingCreateErr(
 	}
 }
 
-func (r *Reconciler) isVMICacheReady(ctx *pkgctx.VirtualMachineContext) bool {
+func (r *Reconciler) isVMICacheReady(ctx *pkgctx.VirtualMachineContext) (bool, error) {
 	vmicName := ctx.VM.Labels[pkgconst.VMICacheLabelKey]
 	if vmicName == "" {
 		// The object is not waiting on a VMI cache object and can proceed.
-		return true
+		return true, nil
 	}
 
 	var (
@@ -774,10 +780,18 @@ func (r *Reconciler) isVMICacheReady(ctx *pkgctx.VirtualMachineContext) bool {
 	)
 
 	if err := r.Client.Get(ctx, vmicKey, &vmic); err != nil {
+		if apierrors.IsNotFound(err) && multivc.NeedsLibraryItemCheck(pkgcfg.FromContext(ctx).MultiVC) {
+			// A VM may already be waiting when its local cache is absent.
+			// Restore that prerequisite without entering VM create/update.
+			if err := r.VMProvider.EnsureVirtualMachineImageCache(ctx, ctx.VM); err != nil {
+				return false, fmt.Errorf("failed to restore image cache prerequisite: %w", err)
+			}
+			return false, nil
+		}
 		ctx.Logger.Error(
 			err,
 			"Skipping due to failure getting vmicache object")
-		return false
+		return false, nil
 	}
 
 	// Assert the image hardware is ready.
@@ -788,7 +802,7 @@ func (r *Reconciler) isVMICacheReady(ctx *pkgctx.VirtualMachineContext) bool {
 		ctx.Logger.V(4).Info(
 			"Skipping due to missing true condition",
 			"conditionType", vmopv1.VirtualMachineImageCacheConditionHardwareReady)
-		return false
+		return false, nil
 	}
 
 	// Check and see if the VM is waiting on the disks yet.
@@ -798,7 +812,7 @@ func (r *Reconciler) isVMICacheReady(ctx *pkgctx.VirtualMachineContext) bool {
 		// resource to be ready with the OVF.
 		delete(ctx.VM.Labels, pkgconst.VMICacheLabelKey)
 
-		return true
+		return true, nil
 	}
 
 	// Find the matching location status.
@@ -813,7 +827,7 @@ func (r *Reconciler) isVMICacheReady(ctx *pkgctx.VirtualMachineContext) bool {
 		delete(ctx.VM.Annotations, pkgconst.VMICacheLocationAnnotationKey)
 
 		ctx.Logger.Info("Removing old VMIC annotation without profileID")
-		return false
+		return false, nil
 
 	case 3:
 		dcID, dsID, pID := locParts[0], locParts[1], locParts[2]
@@ -835,7 +849,7 @@ func (r *Reconciler) isVMICacheReady(ctx *pkgctx.VirtualMachineContext) bool {
 			"Skipping due to missing true condition",
 			"conditionType", vmopv1.VirtualMachineImageCacheConditionFilesReady,
 			"locationStatus", locStatus)
-		return false
+		return false, nil
 	}
 
 	// Remove the label and annotations from the VM that indicate it is waiting
@@ -843,7 +857,7 @@ func (r *Reconciler) isVMICacheReady(ctx *pkgctx.VirtualMachineContext) bool {
 	delete(ctx.VM.Labels, pkgconst.VMICacheLabelKey)
 	delete(ctx.VM.Annotations, pkgconst.VMICacheLocationAnnotationKey)
 
-	return true
+	return true, nil
 }
 
 func filterNoRequeueErr(err error) error {

@@ -43,6 +43,7 @@ Each spec lives under `specs/NNN-slug/`. Standard artifacts: `spec.md` (behavior
 | 010 | [veeam-e2e-backup-restore](specs/010-veeam-e2e-backup-restore/) | Use Veeam for Backup/Restore E2E Tests | In Progress | vmop-4013 |
 | 011 | [snapshot-disk-list](specs/011-snapshot-disk-list/) | Expose Disk List in VirtualMachineSnapshot (CSI Backup API) | In Review | vmop-52730 |
 | 012 | [multivc-policy-cleanup](specs/012-multivc-policy-cleanup/) | Multi-vCenter resource policy deletion fence | Draft | TBD |
+| 013 | [local-image-cache](specs/013-local-image-cache/) | Local image cache bootstrap | Draft | TBD |
 
 ### Finding the right spec
 

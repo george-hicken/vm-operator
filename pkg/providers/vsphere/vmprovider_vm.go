@@ -2436,6 +2436,21 @@ func (vs *vSphereVMProvider) vmCreateGetVirtualMachineClass(
 	return nil
 }
 
+// EnsureVirtualMachineImageCache restores only the image-cache prerequisite.
+// Resolve the image again so that a stale waiting label cannot select an
+// arbitrary provider item. Hardware and files are reconciled by the cache
+// controller before the VM controller can resume normal reconciliation.
+func (vs *vSphereVMProvider) EnsureVirtualMachineImageCache(
+	ctx context.Context, vm *vmopv1.VirtualMachine) error {
+
+	if !pkgcfg.FromContext(ctx).Features.FastDeploy ||
+		!multivc.NeedsLibraryItemCheck(pkgcfg.FromContext(ctx).MultiVC) {
+		return nil
+	}
+	return vs.vmCreateGetVirtualMachineImage(
+		pkgctx.NewVirtualMachineContext(ctx, vm, true), &VMCreateArgs{})
+}
+
 func (vs *vSphereVMProvider) vmCreateGetVirtualMachineImage(
 	vmCtx pkgctx.VirtualMachineContext,
 	createArgs *VMCreateArgs) error {
@@ -2464,6 +2479,17 @@ func (vs *vSphereVMProvider) vmCreateGetVirtualMachineImage(
 			if err := vs.vmCreateUseLocalLibraryItem(vmCtx, createArgs); err != nil {
 				pkgcond.MarkError(vmCtx.VM, vmopv1.VirtualMachineConditionImageReady, "NotFoundInVCenter", err)
 				return err
+			}
+			if pkgcfg.FromContext(vmCtx).Features.FastDeploy {
+				cacheName := pkgutil.VMIName(createArgs.ImageStatus.ProviderItemID)
+				if waiting := vmCtx.VM.Labels[pkgconst.VMICacheLabelKey]; waiting != "" && waiting != cacheName {
+					return fmt.Errorf("image cache %q does not match resolved image cache %q", waiting, cacheName)
+				}
+				if _, err := vs.ensureImageCache(vmCtx,
+					createArgs.ImageStatus.ProviderItemID,
+					createArgs.ImageStatus.ProviderContentVersion); err != nil {
+					return err
+				}
 			}
 		}
 	default:
@@ -2514,6 +2540,13 @@ func (vs *vSphereVMProvider) vmCreateUseLocalLibraryItem(
 	item, err := libMgr.GetLibraryItem(vmCtx, ids[0])
 	if err != nil {
 		return fmt.Errorf("failed to get library item %q: %w", ids[0], err)
+	}
+
+	if item.ID != ids[0] || item.Name != name || !strings.EqualFold(item.Type, createArgs.ImageStatus.Type) {
+		return fmt.Errorf("library item %q does not match image %q of type %q", ids[0], name, createArgs.ImageStatus.Type)
+	}
+	if strings.EqualFold(item.Type, "ovf") && item.ContentVersion == "" {
+		return fmt.Errorf("library item %q has no content version", item.ID)
 	}
 
 	vmCtx.Logger.Info("Using this vCenter's library item for the image",
