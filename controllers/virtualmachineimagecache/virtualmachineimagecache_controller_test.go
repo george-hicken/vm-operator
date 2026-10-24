@@ -1417,6 +1417,7 @@ var _ = Describe("Local image cache recovery", Label(testlabels.Controller, test
 				return nil
 			},
 			func(ctx *builder.IntegrationTestContextForVCSim) {
+				defer func() { panic("VKAL-44897 injected post-Start setup failure") }()
 				connectionConfig := pkgcfg.FromContext(ctx)
 				connectionConfig.MultiVC = pkgcfg.MultiVC{}
 				_, err := realProvider.VSphereClient(pkgcfg.WithContext(ctx, connectionConfig))
@@ -1451,8 +1452,8 @@ var _ = Describe("Local image cache recovery", Label(testlabels.Controller, test
 				vm.Labels[pkgconst.VMICacheLabelKey] = localCache.Name
 				Expect(ctx.Client.Create(ctx, vm)).To(Succeed())
 			})
-		local.BeforeEach()
 		defer local.AfterEach()
+		local.BeforeEach()
 		Eventually(func(g Gomega) {
 			g.Expect(local.Client.Get(local, ctrlclient.ObjectKeyFromObject(&localCache), &localCache)).To(Succeed())
 			g.Expect(pkgcond.IsTrue(localCache, vmopv1.VirtualMachineImageCacheConditionHardwareReady)).To(BeTrue())
