@@ -1417,6 +1417,7 @@ var _ = Describe("Local image cache recovery", Label(testlabels.Controller, test
 				return nil
 			},
 			func(ctx *builder.IntegrationTestContextForVCSim) {
+				defer func() { panic("VKAL-44897 injected post-Start setup failure") }()
 				connectionConfig := pkgcfg.FromContext(ctx)
 				connectionConfig.MultiVC = pkgcfg.MultiVC{}
 				_, err := realProvider.VSphereClient(pkgcfg.WithContext(ctx, connectionConfig))
