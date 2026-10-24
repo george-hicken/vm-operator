@@ -5,6 +5,8 @@
 package crd_test
 
 import (
+	"errors"
+	"fmt"
 	"path/filepath"
 	goruntime "runtime"
 	"testing"
@@ -24,6 +26,7 @@ import (
 
 var (
 	envTestEnv    *envtest.Environment
+	envTestActive bool
 	envTestClient ctrlclient.Client
 )
 
@@ -40,12 +43,21 @@ var _ = BeforeSuite(func() {
 	if !envTestsEnabled() {
 		return
 	}
+	setupComplete := false
+	defer func() {
+		if !setupComplete {
+			if err := stopEnvTest(); err != nil {
+				_, _ = fmt.Fprintf(GinkgoWriter, "failed to stop envtest after setup failure: %v\n", err)
+			}
+		}
+	}()
 
 	rootDir := testutil.GetRootDirOrDie()
 	envTestEnv = &envtest.Environment{
 		BinaryAssetsDirectory: filepath.Join(rootDir, "hack", "tools", "bin", goruntime.GOOS+"_"+goruntime.GOARCH),
 	}
 
+	envTestActive = true
 	cfg, err := envTestEnv.Start()
 	Expect(err).NotTo(HaveOccurred())
 
@@ -54,10 +66,24 @@ var _ = BeforeSuite(func() {
 
 	envTestClient, err = ctrlclient.New(cfg, ctrlclient.Options{Scheme: scheme})
 	Expect(err).NotTo(HaveOccurred())
+	setupComplete = true
 })
 
 var _ = AfterSuite(func() {
-	if envTestEnv != nil {
-		Expect(envTestEnv.Stop()).To(Succeed())
-	}
+	Expect(stopEnvTest()).To(Succeed())
 })
+
+func stopEnvTest() error {
+	if !envTestActive {
+		return nil
+	}
+	err := envTestEnv.Stop()
+	if err != nil {
+		// Environment.Stop may return before stopping the control plane.
+		if stopErr := envTestEnv.ControlPlane.Stop(); stopErr != nil {
+			return errors.Join(err, fmt.Errorf("stop envtest control plane: %w", stopErr))
+		}
+	}
+	envTestActive = false
+	return err
+}
