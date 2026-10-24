@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -78,6 +79,8 @@ type TestSuite struct {
 
 	flags                 testFlags
 	envTest               envtest.Environment
+	envTestActive         bool
+	envTestSetupComplete  bool
 	config                *rest.Config
 	integrationTestClient client.Client
 
@@ -387,8 +390,44 @@ func (s *TestSuite) BeforeSuite() {
 // AfterSuite should be invoked by ginkgo.AfterSuite.
 func (s *TestSuite) AfterSuite() {
 	if envTestsEnabled() {
+		teardownComplete := false
+		defer func() {
+			By("tearing down the test environment", func() {
+				err := s.stopEnvTest()
+				if teardownComplete && s.envTestSetupComplete {
+					Expect(err).To(Succeed())
+				} else if err != nil {
+					_, _ = fmt.Fprintf(GinkgoWriter, "failed to stop envtest after setup or teardown failure: %v\n", err)
+				}
+			})
+		}()
 		s.afterSuiteForIntegrationTesting()
+		teardownComplete = true
 	}
+}
+
+var injectedFirstStopFallback bool
+
+func (s *TestSuite) stopEnvTest() error {
+	if !s.envTestActive {
+		return nil
+	}
+	err := fmt.Errorf("VKAL-44897 injected Environment.Stop error")
+	if err != nil {
+		// Environment.Stop can return before stopping the control plane when
+		// webhook or CRD cleanup fails. Always try to stop its processes.
+		if stopErr := func() error {
+            if !injectedFirstStopFallback {
+                injectedFirstStopFallback = true
+                return fmt.Errorf("VKAL-44897 injected first fallback error")
+            }
+            return s.envTest.ControlPlane.Stop()
+        }(); stopErr != nil {
+			return errors.Join(err, fmt.Errorf("stop envtest control plane: %w", stopErr))
+		}
+	}
+	s.envTestActive = false
+	return err
 }
 
 // Create a new Manager with default values.
@@ -517,6 +556,14 @@ func (s *TestSuite) postConfigureManager() {
 
 func (s *TestSuite) beforeSuiteForIntegrationTesting() {
 	var err error
+	s.envTestSetupComplete = false
+	defer func() {
+		if !s.envTestSetupComplete {
+			if stopErr := s.stopEnvTest(); stopErr != nil {
+				_, _ = fmt.Fprintf(GinkgoWriter, "failed to stop envtest after setup failure: %v\n", stopErr)
+			}
+		}
+	}()
 
 	By("bootstrapping test environment", func() {
 		// Select storage versions before installation. Deleting and reinstalling
@@ -528,6 +575,7 @@ func (s *TestSuite) beforeSuiteForIntegrationTesting() {
 			}
 		}
 
+		s.envTestActive = true
 		s.config, err = s.envTest.Start()
 		Expect(err).ToNot(HaveOccurred())
 		Expect(s.config).ToNot(BeNil())
@@ -583,6 +631,7 @@ func (s *TestSuite) beforeSuiteForIntegrationTesting() {
 			s.postConfigureManager()
 		})
 	}
+	s.envTestSetupComplete = true
 }
 
 func (s *TestSuite) afterSuiteForIntegrationTesting() {
@@ -603,10 +652,6 @@ func (s *TestSuite) afterSuiteForIntegrationTesting() {
 			}
 		})
 	}
-
-	By("tearing down the test environment", func() {
-		Expect(s.envTest.Stop()).To(Succeed())
-	})
 }
 
 func (s *TestSuite) applyFeatureStatesToCRDs(
