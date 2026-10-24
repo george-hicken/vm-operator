@@ -475,10 +475,8 @@ func (c *IntegrationTestContextForVCSim) BeforeEach() {
 
 func (c *IntegrationTestContextForVCSim) AfterEach() {
 	// Tear down the suite first since it may need vC Sim running.
+	defer c.TestContextForVCSim.AfterEach()
 	c.Suite.AfterSuite()
-
-	// Tear down vC Sim.
-	c.TestContextForVCSim.AfterEach()
 }
 
 func (c *TestContextForVCSim) CreateWorkloadNamespace() WorkloadNamespaceInfo {
