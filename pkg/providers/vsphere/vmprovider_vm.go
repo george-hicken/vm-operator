@@ -1314,31 +1314,70 @@ func (vs *vSphereVMProvider) getRecentTaskInfo(
 	ctx pkgctx.VirtualMachineContext,
 	vcClient *vcclient.Client) (context.Context, error) {
 
-	logger := pkglog.FromContextOrDefault(ctx)
+	if len(ctx.MoVM.RecentTask) == 0 {
+		return ctx.Context, nil
+	}
+
+	objectSet := make([]vimtypes.ObjectSpec, len(ctx.MoVM.RecentTask))
+	for i, ref := range ctx.MoVM.RecentTask {
+		objectSet[i].Obj = ref
+	}
+
+	// Tasks can expire between fetching recentTask and retrieving their info.
+	// Allow missing objects so one expired task does not fail the whole batch.
 	pc := property.DefaultCollector(vcClient.VimClient())
+	res, err := pc.RetrieveProperties(ctx, vimtypes.RetrieveProperties{
+		SpecSet: []vimtypes.PropertyFilterSpec{{
+			PropSet: []vimtypes.PropertySpec{{
+				Type:    "Task",
+				PathSet: []string{"info"},
+			}},
+			ObjectSet:                     objectSet,
+			ReportMissingObjectsInResults: new(true),
+		}},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to retrieve task info: %w", err)
+	}
 
-	// Check if the VM has any recent tasks.
-	var rt []vimtypes.TaskInfo
-	for _, taskRef := range ctx.MoVM.RecentTask {
-		var t mo.Task
-		if err := pc.RetrieveOne(
-			ctx,
-			taskRef,
-			[]string{"info"},
-			&t); err != nil {
+	logger := pkglog.FromContextOrDefault(ctx)
 
-			// Tasks go away after 10m of completion.
-			if !fault.Is(err, &vimtypes.ManagedObjectNotFound{}) {
-				return nil, fmt.Errorf("failed to retrieve task info: %w", err)
+	// Property collector results need not follow the requested object order.
+	// Preserve recentTask order because consumers may act on the first task.
+	contents := make(map[vimtypes.ManagedObjectReference]vimtypes.ObjectContent, len(res.Returnval))
+	for _, content := range res.Returnval {
+		contents[content.Obj] = content
+	}
+
+	rt := make([]vimtypes.TaskInfo, 0, len(res.Returnval))
+	for _, ref := range ctx.MoVM.RecentTask {
+		content, ok := contents[ref]
+		if !ok {
+			continue
+		}
+
+		task, err := mo.ObjectContentToType(content)
+		if err != nil {
+			if fault.Is(err, &vimtypes.ManagedObjectNotFound{}) {
+				continue
 			}
-		} else {
-			logLevel := 4
-			if t.Info.State == vimtypes.TaskInfoStateRunning ||
-				t.Info.State == vimtypes.TaskInfoStateError {
+			return nil, fmt.Errorf("failed to retrieve task info: %w", err)
+		}
 
-				logLevel = 2
-			}
+		t, ok := task.(mo.Task)
+		if !ok {
+			return nil, fmt.Errorf("failed to retrieve task info for %s: unexpected object type %T", ref, task)
+		}
+		rt = append(rt, t.Info)
 
+		logLevel := 4
+		if t.Info.State == vimtypes.TaskInfoStateRunning ||
+			t.Info.State == vimtypes.TaskInfoStateError {
+
+			logLevel = 2
+		}
+
+		if l := logger.V(logLevel); l.Enabled() {
 			var descMsg string
 			if t.Info.Description != nil {
 				descMsg = t.Info.Description.Message
@@ -1359,7 +1398,7 @@ func (vs *vSphereVMProvider) getRecentTaskInfo(
 				startTime = t.Info.StartTime.String()
 			}
 
-			logger.V(logLevel).Info("VM has task",
+			l.Info("VM has task",
 				"activationId", t.Info.ActivationId,
 				"descriptionId", t.Info.DescriptionId,
 				"description", descMsg,
@@ -1383,7 +1422,6 @@ func (vs *vSphereVMProvider) getRecentTaskInfo(
 				"startTime", startTime,
 				"state", t.Info.State,
 				"task", t.Info.Task)
-			rt = append(rt, t.Info)
 		}
 	}
 
@@ -2436,6 +2474,21 @@ func (vs *vSphereVMProvider) vmCreateGetVirtualMachineClass(
 	return nil
 }
 
+// EnsureVirtualMachineImageCache restores only the image-cache prerequisite.
+// Resolve the image again so that a stale waiting label cannot select an
+// arbitrary provider item. Hardware and files are reconciled by the cache
+// controller before the VM controller can resume normal reconciliation.
+func (vs *vSphereVMProvider) EnsureVirtualMachineImageCache(
+	ctx context.Context, vm *vmopv1.VirtualMachine) error {
+
+	if !pkgcfg.FromContext(ctx).Features.FastDeploy ||
+		!multivc.NeedsLibraryItemCheck(pkgcfg.FromContext(ctx).MultiVC) {
+		return nil
+	}
+	return vs.vmCreateGetVirtualMachineImage(
+		pkgctx.NewVirtualMachineContext(ctx, vm, true), &VMCreateArgs{})
+}
+
 func (vs *vSphereVMProvider) vmCreateGetVirtualMachineImage(
 	vmCtx pkgctx.VirtualMachineContext,
 	createArgs *VMCreateArgs) error {
@@ -2464,6 +2517,17 @@ func (vs *vSphereVMProvider) vmCreateGetVirtualMachineImage(
 			if err := vs.vmCreateUseLocalLibraryItem(vmCtx, createArgs); err != nil {
 				pkgcond.MarkError(vmCtx.VM, vmopv1.VirtualMachineConditionImageReady, "NotFoundInVCenter", err)
 				return err
+			}
+			if pkgcfg.FromContext(vmCtx).Features.FastDeploy {
+				cacheName := pkgutil.VMIName(createArgs.ImageStatus.ProviderItemID)
+				if waiting := vmCtx.VM.Labels[pkgconst.VMICacheLabelKey]; waiting != "" && waiting != cacheName {
+					return fmt.Errorf("image cache %q does not match resolved image cache %q", waiting, cacheName)
+				}
+				if _, err := vs.ensureImageCache(vmCtx,
+					createArgs.ImageStatus.ProviderItemID,
+					createArgs.ImageStatus.ProviderContentVersion); err != nil {
+					return err
+				}
 			}
 		}
 	default:
@@ -2514,6 +2578,13 @@ func (vs *vSphereVMProvider) vmCreateUseLocalLibraryItem(
 	item, err := libMgr.GetLibraryItem(vmCtx, ids[0])
 	if err != nil {
 		return fmt.Errorf("failed to get library item %q: %w", ids[0], err)
+	}
+
+	if item.ID != ids[0] || item.Name != name || !strings.EqualFold(item.Type, createArgs.ImageStatus.Type) {
+		return fmt.Errorf("library item %q does not match image %q of type %q", ids[0], name, createArgs.ImageStatus.Type)
+	}
+	if strings.EqualFold(item.Type, "ovf") && item.ContentVersion == "" {
+		return fmt.Errorf("library item %q has no content version", item.ID)
 	}
 
 	vmCtx.Logger.Info("Using this vCenter's library item for the image",

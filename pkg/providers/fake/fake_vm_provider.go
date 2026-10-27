@@ -32,6 +32,7 @@ import (
 // expected to evolve as more tests get added in the future.
 
 type funcs struct {
+	EnsureVirtualMachineImageCacheFn    func(ctx context.Context, vm *vmopv1.VirtualMachine) error
 	CreateOrUpdateVirtualMachineFn      func(ctx context.Context, vm *vmopv1.VirtualMachine) error
 	CreateOrUpdateVirtualMachineAsyncFn func(ctx context.Context, vm *vmopv1.VirtualMachine) (<-chan error, error)
 	DeleteVirtualMachineFn              func(ctx context.Context, vm *vmopv1.VirtualMachine) error
@@ -286,6 +287,16 @@ func (s *VMProvider) UpdateVcCreds(ctx context.Context, data map[string][]byte) 
 	defer s.Unlock()
 	if s.UpdateVcCredsFn != nil {
 		return s.UpdateVcCredsFn(ctx, data)
+	}
+	return nil
+}
+
+// EnsureVirtualMachineImageCache invokes the configured prerequisite recovery.
+func (s *VMProvider) EnsureVirtualMachineImageCache(ctx context.Context, vm *vmopv1.VirtualMachine) error {
+	s.Lock()
+	defer s.Unlock()
+	if s.EnsureVirtualMachineImageCacheFn != nil {
+		return s.EnsureVirtualMachineImageCacheFn(ctx, vm)
 	}
 	return nil
 }

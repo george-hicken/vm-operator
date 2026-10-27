@@ -145,6 +145,75 @@ func unitTestsReconcile() {
 		fakeVMProvider = nil
 	})
 
+	Context("missing local image cache recovery", func() {
+		It("restores the prerequisite for an existing VM without entering create or update", func() {
+			pkgcfg.SetContext(vmCtx, func(config *pkgcfg.Config) {
+				config.Features.FastDeploy = true
+				config.MultiVC = pkgcfg.MultiVC{Mode: pkgcfg.MultiVCModeShard, ShardSDDC: "local"}
+			})
+			vm.Status.UniqueID = "vm-existing"
+			vm.Labels = map[string]string{pkgconst.VMICacheLabelKey: "vmi-local"}
+			var recoveries, operations int
+			fakeVMProvider.EnsureVirtualMachineImageCacheFn = func(ctx context.Context, obj *vmopv1.VirtualMachine) error {
+				recoveries++
+				Expect(obj).To(BeIdenticalTo(vm))
+				return reconciler.Client.Create(ctx, &vmopv1.VirtualMachineImageCache{
+					ObjectMeta: metav1.ObjectMeta{Namespace: pkgcfg.FromContext(ctx).PodNamespace, Name: "vmi-local"},
+				})
+			}
+			fakeVMProvider.CreateOrUpdateVirtualMachineFn = func(context.Context, *vmopv1.VirtualMachine) error {
+				operations++
+				return nil
+			}
+			Expect(pkgerr.IsNoRequeueError(reconciler.ReconcileNormal(vmCtx))).To(BeTrue())
+			Expect(recoveries).To(Equal(1))
+			Expect(operations).To(BeZero())
+			Expect(pkgerr.IsNoRequeueError(reconciler.ReconcileNormal(vmCtx))).To(BeTrue())
+			Expect(recoveries).To(Equal(1))
+			Expect(operations).To(BeZero())
+			Expect(vm.Labels).To(HaveKeyWithValue(pkgconst.VMICacheLabelKey, "vmi-local"))
+		})
+
+		It("retries a failed recovery without entering VM create or update", func() {
+			pkgcfg.SetContext(vmCtx, func(config *pkgcfg.Config) {
+				config.Features.FastDeploy = true
+				config.MultiVC = pkgcfg.MultiVC{Mode: pkgcfg.MultiVCModeShard, ShardSDDC: "local"}
+			})
+			vm.Labels = map[string]string{pkgconst.VMICacheLabelKey: "vmi-local"}
+			failure := errors.New("provider temporarily unavailable")
+			fakeVMProvider.EnsureVirtualMachineImageCacheFn = func(context.Context, *vmopv1.VirtualMachine) error { return failure }
+			fakeVMProvider.CreateOrUpdateVirtualMachineFn = func(context.Context, *vmopv1.VirtualMachine) error {
+				Fail("VM operation must remain gated during failed recovery")
+				return nil
+			}
+			Expect(reconciler.ReconcileNormal(vmCtx)).To(MatchError(failure))
+			fakeVMProvider.EnsureVirtualMachineImageCacheFn = func(ctx context.Context, _ *vmopv1.VirtualMachine) error {
+				return reconciler.Client.Create(ctx, &vmopv1.VirtualMachineImageCache{
+					ObjectMeta: metav1.ObjectMeta{Namespace: pkgcfg.FromContext(ctx).PodNamespace, Name: "vmi-local"},
+				})
+			}
+			// The retry needs no intervening VM or image-cache event.
+			Expect(pkgerr.IsNoRequeueError(reconciler.ReconcileNormal(vmCtx))).To(BeTrue())
+			var restored vmopv1.VirtualMachineImageCache
+			Expect(reconciler.Client.Get(vmCtx, client.ObjectKey{Namespace: pkgcfg.FromContext(vmCtx).PodNamespace, Name: "vmi-local"}, &restored)).To(Succeed())
+		})
+
+		It("does not recover missing caches in combined or sole-shard mode", func() {
+			for _, mode := range []pkgcfg.MultiVC{{}, {Mode: pkgcfg.MultiVCModeShard, ShardSDDC: "local", Sole: true}} {
+				pkgcfg.SetContext(vmCtx, func(config *pkgcfg.Config) {
+					config.Features.FastDeploy = true
+					config.MultiVC = mode
+				})
+				vm.Labels = map[string]string{pkgconst.VMICacheLabelKey: "vmi-local"}
+				fakeVMProvider.EnsureVirtualMachineImageCacheFn = func(context.Context, *vmopv1.VirtualMachine) error {
+					Fail("cache recovery must be confined to multiple-vCenter shards")
+					return nil
+				}
+				Expect(pkgerr.IsNoRequeueError(reconciler.ReconcileNormal(vmCtx))).To(BeTrue())
+			}
+		})
+	})
+
 	Context("Reconcile", func() {
 		BeforeEach(func() {
 			initObjects = append(initObjects, vm)

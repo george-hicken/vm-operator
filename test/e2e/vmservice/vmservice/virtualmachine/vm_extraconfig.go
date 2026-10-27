@@ -33,7 +33,6 @@ import (
 
 	"github.com/vmware-tanzu/vm-operator/test/e2e/framework"
 	"github.com/vmware-tanzu/vm-operator/test/e2e/infrastructure/vsphere/vcenter"
-	"github.com/vmware-tanzu/vm-operator/test/e2e/vmservice/common"
 	e2eConfig "github.com/vmware-tanzu/vm-operator/test/e2e/vmservice/config"
 	"github.com/vmware-tanzu/vm-operator/test/e2e/vmservice/consts"
 	"github.com/vmware-tanzu/vm-operator/test/e2e/vmservice/lib/vmoperator"
@@ -74,7 +73,7 @@ func VMExtraConfigSpec(ctx context.Context, inputGetter func() VMExtraConfigSpec
 	var (
 		input           VMExtraConfigSpecInput
 		config          *e2eConfig.E2EConfig
-		clusterProxy    *common.VMServiceClusterProxy
+		clusterProxy    framework.ClusterProxyInterface
 		svClusterClient ctrlclient.Client
 		vCenterClient   *vim25.Client
 		vmClassName     string
@@ -99,12 +98,12 @@ func VMExtraConfigSpec(ctx context.Context, inputGetter func() VMExtraConfigSpec
 		skipper.SkipUnlessInfraIs(input.Config.InfraConfig.InfraName, consts.WCP)
 		skipper.SkipUnlessSupervisorCapabilityEnabled(
 			ctx,
-			input.ClusterProxy.(*common.VMServiceClusterProxy),
+			input.ClusterProxy,
 			consts.TelcoVMServiceAPICapabilityName,
 		)
 
 		config = input.Config
-		clusterProxy = input.ClusterProxy.(*common.VMServiceClusterProxy)
+		clusterProxy = input.ClusterProxy
 		svClusterClient = clusterProxy.GetClient()
 
 		cancelPodWatches := framework.WatchPodLogsAndEventsInNamespaces(
@@ -197,9 +196,7 @@ func VMExtraConfigSpec(ctx context.Context, inputGetter func() VMExtraConfigSpec
 					},
 				},
 			})
-			Expect(svClusterClient.Create(ctx, vm)).To(Succeed(), "failed to create VM %s", vmName)
-			vmoperator.DeferCleanupVirtualMachine(config, svClusterClient, clusterProxy.GetKubeconfigPath(),
-				vm.Namespace, vm.Name, input.SkipCleanup)
+			vmoperator.CreateVirtualMachine(ctx, config, clusterProxy, vm, input.SkipCleanup)
 
 			By("Waiting for VM to be created in vSphere")
 			vmoperator.WaitForVirtualMachineConditionCreated(
@@ -268,9 +265,7 @@ func VMExtraConfigSpec(ctx context.Context, inputGetter func() VMExtraConfigSpec
 					VMXSwapEnabled:                     ptr.To(true),
 				},
 			})
-			Expect(svClusterClient.Create(ctx, vm)).To(Succeed(), "failed to create VM %s", vmName)
-			vmoperator.DeferCleanupVirtualMachine(config, svClusterClient, clusterProxy.GetKubeconfigPath(),
-				vm.Namespace, vm.Name, input.SkipCleanup)
+			vmoperator.CreateVirtualMachine(ctx, config, clusterProxy, vm, input.SkipCleanup)
 
 			vmoperator.WaitForVirtualMachineConditionCreated(
 				ctx, config, svClusterClient, input.WCPNamespaceName, vmName)
@@ -340,9 +335,7 @@ func VMExtraConfigSpec(ctx context.Context, inputGetter func() VMExtraConfigSpec
 					},
 				},
 			})
-			Expect(svClusterClient.Create(ctx, vm)).To(Succeed(), "failed to create VM %s", vmName)
-			vmoperator.DeferCleanupVirtualMachine(config, svClusterClient, clusterProxy.GetKubeconfigPath(),
-				vm.Namespace, vm.Name, input.SkipCleanup)
+			vmoperator.CreateVirtualMachine(ctx, config, clusterProxy, vm, input.SkipCleanup)
 
 			vmoperator.WaitForVirtualMachineConditionCreated(
 				ctx, config, svClusterClient, input.WCPNamespaceName, vmName)
@@ -417,9 +410,7 @@ func VMExtraConfigSpec(ctx context.Context, inputGetter func() VMExtraConfigSpec
 				StorageClass: storageClass,
 				Advanced:     advanced,
 			})
-			Expect(svClusterClient.Create(ctx, vm)).To(Succeed(), "failed to create VM %s", vmName)
-			vmoperator.DeferCleanupVirtualMachine(config, svClusterClient, clusterProxy.GetKubeconfigPath(),
-				vm.Namespace, vm.Name, input.SkipCleanup)
+			vmoperator.CreateVirtualMachine(ctx, config, clusterProxy, vm, input.SkipCleanup)
 
 			vmoperator.WaitForVirtualMachineConditionCreated(
 				ctx, config, svClusterClient, input.WCPNamespaceName, vmName)
@@ -485,9 +476,7 @@ func VMExtraConfigSpec(ctx context.Context, inputGetter func() VMExtraConfigSpec
 					VMXSwapEnabled:                     ptr.To(true),
 				},
 			})
-			Expect(svClusterClient.Create(ctx, vm)).To(Succeed(), "failed to create VM %s", vmName)
-			vmoperator.DeferCleanupVirtualMachine(config, svClusterClient, clusterProxy.GetKubeconfigPath(),
-				vm.Namespace, vm.Name, input.SkipCleanup)
+			vmoperator.CreateVirtualMachine(ctx, config, clusterProxy, vm, input.SkipCleanup)
 
 			vmoperator.WaitForVirtualMachineConditionCreated(
 				ctx, config, svClusterClient, input.WCPNamespaceName, vmName)
@@ -557,9 +546,7 @@ func VMExtraConfigSpec(ctx context.Context, inputGetter func() VMExtraConfigSpec
 					},
 				},
 			})
-			Expect(svClusterClient.Create(ctx, vm)).To(Succeed(), "failed to create VM %s", vmName)
-			vmoperator.DeferCleanupVirtualMachine(config, svClusterClient, clusterProxy.GetKubeconfigPath(),
-				vm.Namespace, vm.Name, input.SkipCleanup)
+			vmoperator.CreateVirtualMachine(ctx, config, clusterProxy, vm, input.SkipCleanup)
 
 			vmoperator.WaitForVirtualMachineConditionCreated(
 				ctx, config, svClusterClient, input.WCPNamespaceName, vmName)
@@ -651,9 +638,7 @@ func VMExtraConfigSpec(ctx context.Context, inputGetter func() VMExtraConfigSpec
 					PNUMANodeAffinity: []int32{0},
 				},
 			})
-			Expect(svClusterClient.Create(ctx, vm)).To(Succeed(), "failed to create VM %s", vmName)
-			vmoperator.DeferCleanupVirtualMachine(config, svClusterClient, clusterProxy.GetKubeconfigPath(),
-				vm.Namespace, vm.Name, input.SkipCleanup)
+			vmoperator.CreateVirtualMachine(ctx, config, clusterProxy, vm, input.SkipCleanup)
 
 			vmoperator.WaitForVirtualMachineConditionCreated(
 				ctx, config, svClusterClient, input.WCPNamespaceName, vmName)
@@ -727,9 +712,7 @@ func VMExtraConfigSpec(ctx context.Context, inputGetter func() VMExtraConfigSpec
 					},
 				},
 			}
-			Expect(svClusterClient.Create(ctx, vm)).To(Succeed(), "failed to create VM %s", vmName)
-			vmoperator.DeferCleanupVirtualMachine(config, svClusterClient, clusterProxy.GetKubeconfigPath(),
-				vm.Namespace, vm.Name, input.SkipCleanup)
+			vmoperator.CreateVirtualMachine(ctx, config, clusterProxy, vm, input.SkipCleanup)
 
 			By("Waiting for VM to be created in vSphere")
 			vmoperator.WaitForVirtualMachineConditionCreated(
@@ -766,9 +749,7 @@ func VMExtraConfigSpec(ctx context.Context, inputGetter func() VMExtraConfigSpec
 					VMXSwapEnabled: ptr.To(true),
 				},
 			})
-			Expect(svClusterClient.Create(ctx, vm)).To(Succeed(), "failed to create VM %s", vmName)
-			vmoperator.DeferCleanupVirtualMachine(config, svClusterClient, clusterProxy.GetKubeconfigPath(),
-				vm.Namespace, vm.Name, input.SkipCleanup)
+			vmoperator.CreateVirtualMachine(ctx, config, clusterProxy, vm, input.SkipCleanup)
 
 			vmoperator.WaitForVirtualMachineConditionCreated(
 				ctx, config, svClusterClient, input.WCPNamespaceName, vmName)
@@ -860,9 +841,7 @@ func VMExtraConfigSpec(ctx context.Context, inputGetter func() VMExtraConfigSpec
 				ReservationLockedToMax: ptr.To(true),
 			}
 
-			Expect(svClusterClient.Create(ctx, vm)).To(Succeed(), "failed to create VM %s", vmName)
-			vmoperator.DeferCleanupVirtualMachine(config, svClusterClient, clusterProxy.GetKubeconfigPath(),
-				vm.Namespace, vm.Name, input.SkipCleanup)
+			vmoperator.CreateVirtualMachine(ctx, config, clusterProxy, vm, input.SkipCleanup)
 
 			By("Waiting for VM to be created in vSphere (powered off)")
 			vmoperator.WaitForVirtualMachineConditionCreated(
