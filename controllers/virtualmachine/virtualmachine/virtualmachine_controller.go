@@ -16,11 +16,13 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
+	ctrlbuilder "sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
@@ -30,6 +32,7 @@ import (
 	vmopv1 "github.com/vmware-tanzu/vm-operator/api/v1alpha6"
 	byokv1 "github.com/vmware-tanzu/vm-operator/external/byok/api/v1alpha1"
 	ncpv1alpha1 "github.com/vmware-tanzu/vm-operator/external/ncp/api/v1alpha1"
+	topologyv1 "github.com/vmware-tanzu/vm-operator/external/tanzu-topology/api/v1alpha1"
 	cnsv1alpha1 "github.com/vmware-tanzu/vm-operator/external/vsphere-csi-driver/api/v1alpha1"
 	vspherepolv1 "github.com/vmware-tanzu/vm-operator/external/vsphere-policy/api/v1alpha1"
 	pkgcond "github.com/vmware-tanzu/vm-operator/pkg/conditions"
@@ -43,6 +46,7 @@ import (
 	"github.com/vmware-tanzu/vm-operator/pkg/prober"
 	"github.com/vmware-tanzu/vm-operator/pkg/providers"
 	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere"
+	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/placement"
 	"github.com/vmware-tanzu/vm-operator/pkg/record"
 	kubeutil "github.com/vmware-tanzu/vm-operator/pkg/util/kube"
 	"github.com/vmware-tanzu/vm-operator/pkg/util/kube/cource"
@@ -121,6 +125,13 @@ func AddToManager(ctx *pkgctx.ControllerManagerContext, mgr manager.Manager) err
 
 	builder = builder.Watches(&vmopv1.VirtualMachineClass{},
 		handler.EnqueueRequestsFromMapFunc(classToVMMapperFn(ctx, r.Client)))
+
+	// Watch Zones so a VM that found no placement candidates is retried as
+	// soon as a Zone in its namespace changes (e.g. gains its folder and
+	// resource pool MoIDs), rather than waiting for the requeue delay.
+	builder = builder.Watches(&topologyv1.Zone{},
+		handler.EnqueueRequestsFromMapFunc(ZoneToUnplacedVMsMapperFn(ctx, r.Client)),
+		ctrlbuilder.WithPredicates(predicate.GenerationChangedPredicate{}))
 
 	if pkgcfg.FromContext(ctx).Features.BringYourOwnEncryptionKey {
 		builder = builder.Watches(
@@ -295,6 +306,40 @@ func classToVMMapperFn(
 
 		if len(reconcileRequests) > 0 {
 			logger.V(4).Info("Returning VM reconcile requests due to VirtualMachineClass watch", "requests", reconcileRequests)
+		}
+		return reconcileRequests
+	}
+}
+
+// ZoneToUnplacedVMsMapperFn returns a mapper that, for a given Zone, returns
+// reconcile requests for the VirtualMachines in the Zone's namespace that
+// have not yet been placed, i.e. that are not Created or have no zone label.
+func ZoneToUnplacedVMsMapperFn(
+	ctx *pkgctx.ControllerManagerContext,
+	c client.Client) func(_ context.Context, o client.Object) []reconcile.Request {
+
+	return func(_ context.Context, o client.Object) []reconcile.Request {
+		zone := o.(*topologyv1.Zone)
+		logger := ctx.Logger.WithValues("name", zone.Name, "namespace", zone.Namespace)
+
+		vmList := &vmopv1.VirtualMachineList{}
+		if err := c.List(ctx, vmList, client.InNamespace(zone.Namespace)); err != nil {
+			logger.Error(err, "Failed to list VirtualMachines for reconciliation due to Zone watch")
+			return nil
+		}
+
+		var reconcileRequests []reconcile.Request
+		for _, vm := range vmList.Items {
+			if pkgcond.IsTrue(&vm, vmopv1.VirtualMachineConditionCreated) &&
+				vm.Labels[corev1.LabelTopologyZone] != "" {
+				continue
+			}
+			key := client.ObjectKey{Namespace: vm.Namespace, Name: vm.Name}
+			reconcileRequests = append(reconcileRequests, reconcile.Request{NamespacedName: key})
+		}
+
+		if len(reconcileRequests) > 0 {
+			logger.V(4).Info("Returning VM reconcile requests due to Zone watch", "requests", reconcileRequests)
 		}
 		return reconcileRequests
 	}
@@ -475,6 +520,19 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Re
 	}
 
 	err = r.ReconcileNormal(vmCtx)
+	if errors.Is(err, placement.ErrNoPlacementCandidates) {
+		// No placement candidates is an expected wait, e.g. for the Zones in
+		// the namespace to become usable, so requeue after a fixed delay
+		// instead of entering exponential backoff. The Zone watch triggers an
+		// earlier reconcile when a Zone changes.
+		pkgcond.MarkFalse(
+			vm,
+			vmopv1.VirtualMachineConditionPlacementReady,
+			"NoPlacementCandidates",
+			"%s",
+			err.Error())
+		return ctrl.Result{RequeueAfter: pkgcfg.FromContext(ctx).CreateVMRequeueDelay}, nil
+	}
 	if err != nil && !ignoredCreateErr(err) {
 		return pkgerr.ResultFromError(err)
 	}

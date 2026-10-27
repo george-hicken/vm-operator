@@ -7,6 +7,7 @@ package virtualmachine_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync/atomic"
 
@@ -20,8 +21,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	vmopv1 "github.com/vmware-tanzu/vm-operator/api/v1alpha6"
+	topologyv1 "github.com/vmware-tanzu/vm-operator/external/tanzu-topology/api/v1alpha1"
 
 	"github.com/vmware-tanzu/vm-operator/controllers/virtualmachine/virtualmachine"
+	pkgcond "github.com/vmware-tanzu/vm-operator/pkg/conditions"
 	pkgcfg "github.com/vmware-tanzu/vm-operator/pkg/config"
 	pkgconst "github.com/vmware-tanzu/vm-operator/pkg/constants"
 	"github.com/vmware-tanzu/vm-operator/pkg/constants/testlabels"
@@ -32,6 +35,7 @@ import (
 	"github.com/vmware-tanzu/vm-operator/pkg/providers"
 	providerfake "github.com/vmware-tanzu/vm-operator/pkg/providers/fake"
 	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere"
+	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/placement"
 	kubeutil "github.com/vmware-tanzu/vm-operator/pkg/util/kube"
 	"github.com/vmware-tanzu/vm-operator/pkg/util/kube/cource"
 	"github.com/vmware-tanzu/vm-operator/pkg/util/ovfcache"
@@ -174,6 +178,103 @@ func unitTestsReconcile() {
 				Expect(vmCtx.VM.GetFinalizers()).To(ContainElement(finalizer))
 				Expect(res.RequeueAfter).To(Equal(pkgcfg.FromContext(ctx).CreateVMRequeueDelay))
 			})
+		})
+		When("reconcile fails with no placement candidates", func() {
+			It("should succeed with a fixed requeue delay and mark PlacementReady false", func() {
+				providerfake.SetCreateOrUpdateFunction(
+					ctx,
+					fakeVMProvider,
+					func(ctx context.Context, vm *vmopv1.VirtualMachine) error {
+						return fmt.Errorf("placement failed: %w", placement.ErrNoPlacementCandidates)
+					},
+				)
+
+				req := ctrl.Request{}
+				req.Namespace = vm.Namespace
+				req.Name = vm.Name
+
+				res, err := reconciler.Reconcile(ctx, req)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(res.RequeueAfter).To(Equal(pkgcfg.FromContext(ctx).CreateVMRequeueDelay))
+
+				var obj vmopv1.VirtualMachine
+				Expect(ctx.Client.Get(ctx, client.ObjectKeyFromObject(vm), &obj)).To(Succeed())
+				c := pkgcond.Get(&obj, vmopv1.VirtualMachineConditionPlacementReady)
+				Expect(c).ToNot(BeNil())
+				Expect(c.Status).To(Equal(metav1.ConditionFalse))
+				Expect(c.Reason).To(Equal("NoPlacementCandidates"))
+			})
+		})
+
+		When("reconcile fails with another error", func() {
+			It("should return the error", func() {
+				providerfake.SetCreateOrUpdateFunction(
+					ctx,
+					fakeVMProvider,
+					func(ctx context.Context, vm *vmopv1.VirtualMachine) error {
+						return errors.New(providerError)
+					},
+				)
+
+				req := ctrl.Request{}
+				req.Namespace = vm.Namespace
+				req.Name = vm.Name
+
+				_, err := reconciler.Reconcile(ctx, req)
+				Expect(err).To(MatchError(ContainSubstring(providerError)))
+			})
+		})
+	})
+
+	Context("ZoneToUnplacedVMsMapperFn", func() {
+		var (
+			zone *topologyv1.Zone
+		)
+
+		newVM := func(ns, name, zoneName string, created bool) *vmopv1.VirtualMachine {
+			obj := &vmopv1.VirtualMachine{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: ns,
+					Name:      name,
+					Labels:    map[string]string{},
+				},
+			}
+			if zoneName != "" {
+				obj.Labels[corev1.LabelTopologyZone] = zoneName
+			}
+			if created {
+				pkgcond.MarkTrue(obj, vmopv1.VirtualMachineConditionCreated)
+			}
+			return obj
+		}
+
+		BeforeEach(func() {
+			zone = &topologyv1.Zone{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "dummy-ns",
+					Name:      "zone-a",
+				},
+			}
+			initObjects = append(initObjects,
+				newVM("dummy-ns", "placed", "zone-a", true),
+				newVM("dummy-ns", "not-created", "zone-a", false),
+				newVM("dummy-ns", "no-zone", "", true),
+				newVM("other-ns", "other", "", false),
+			)
+		})
+
+		It("enqueues only the unplaced VMs in the Zone's namespace", func() {
+			mapFn := virtualmachine.ZoneToUnplacedVMsMapperFn(
+				&pkgctx.ControllerManagerContext{
+					Context: ctx,
+					Logger:  ctx.Logger,
+				},
+				ctx.Client)
+			reqs := mapFn(ctx, zone)
+			Expect(reqs).To(ConsistOf(
+				ctrl.Request{NamespacedName: client.ObjectKey{Namespace: "dummy-ns", Name: "not-created"}},
+				ctrl.Request{NamespacedName: client.ObjectKey{Namespace: "dummy-ns", Name: "no-zone"}},
+			))
 		})
 	})
 
