@@ -2187,7 +2187,7 @@ func (vs *vSphereVMProvider) vmCreateGetSourceFilePaths(
 	}
 
 	var (
-		datacenterID = vs.vcClient.Datacenter().Reference().Value
+		datacenterID = vcClient.Datacenter().Reference().Value
 		datastoreID  = createArgs.Datastores[0].MoRef.Value
 		itemID       = createArgs.ImageStatus.ProviderItemID
 		itemVersion  = createArgs.ImageStatus.ProviderContentVersion
