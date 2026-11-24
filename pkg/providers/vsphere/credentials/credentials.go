@@ -10,6 +10,7 @@ import (
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -20,6 +21,12 @@ type VSphereVMProviderCredentials struct {
 	Password string
 }
 
+// ErrSecretNotFound is returned, wrapped, when the credentials Secret does not
+// exist. Unlike other failures it resolves on its own once the Secret is
+// written, so callers can wait for it instead of backing off exponentially.
+var ErrSecretNotFound = errors.New("provider credentials secret not found")
+
+// GetProviderCredentials returns the vCenter credentials in the named Secret.
 func GetProviderCredentials(
 	ctx context.Context,
 	client ctrlclient.Client,
@@ -28,6 +35,10 @@ func GetProviderCredentials(
 	secret := &corev1.Secret{}
 	secretKey := types.NamespacedName{Namespace: namespace, Name: secretName}
 	if err := client.Get(ctx, secretKey, secret); err != nil {
+		if apierrors.IsNotFound(err) {
+			return VSphereVMProviderCredentials{}, fmt.Errorf(
+				"cannot find secret for provider credentials: %s: %w: %w", secretKey, ErrSecretNotFound, err)
+		}
 		return VSphereVMProviderCredentials{}, fmt.Errorf("cannot find secret for provider credentials: %s: %w", secretKey, err)
 	}
 

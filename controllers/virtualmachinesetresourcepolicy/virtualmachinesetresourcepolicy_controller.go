@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"time"
 
 	"github.com/go-logr/logr"
 	"k8s.io/client-go/util/retry"
@@ -29,7 +30,12 @@ import (
 	"github.com/vmware-tanzu/vm-operator/pkg/multivc"
 	"github.com/vmware-tanzu/vm-operator/pkg/patch"
 	"github.com/vmware-tanzu/vm-operator/pkg/providers"
+	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/credentials"
 )
+
+// credentialsRequeue is how long to wait for the provider credentials Secret.
+// In multi-vCenter shard mode the Secret is written after the shard starts.
+const credentialsRequeue = 15 * time.Second
 
 const (
 	finalizerName           = "vmoperator.vmware.com/virtualmachinesetresourcepolicy"
@@ -323,5 +329,17 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Re
 		return ctrl.Result{}, r.ReconcileDelete(rpCtx)
 	}
 
-	return ctrl.Result{}, r.ReconcileNormal(rpCtx)
+	if err := r.ReconcileNormal(rpCtx); err != nil {
+		if errors.Is(err, credentials.ErrSecretNotFound) {
+			// Returning the error would consume the rate limiter's backoff
+			// while the Secret is still absent, delaying the retry long after
+			// the Secret appears.
+			rpCtx.Logger.Info("Waiting for the provider credentials Secret",
+				"requeueAfter", credentialsRequeue, "reason", err.Error())
+			return ctrl.Result{RequeueAfter: credentialsRequeue}, nil
+		}
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{}, nil
 }

@@ -11,6 +11,7 @@ import (
 	. "github.com/onsi/gomega"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/credentials"
@@ -51,6 +52,14 @@ var _ = Describe("GetProviderCredentials", func() {
 			credsOut, err := credentials.GetProviderCredentials(ctx, client, secretIn.Namespace, secretIn.Name)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(credsOut).To(Equal(credsIn))
+		})
+	})
+
+	Context("when the secret does not exist", func() {
+		Specify("returns ErrSecretNotFound", func() {
+			_, err := credentials.GetProviderCredentials(ctx, builder.NewFakeClient(), "some-namespace", "some-name")
+			Expect(err).To(MatchError(credentials.ErrSecretNotFound))
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
 		})
 	})
 

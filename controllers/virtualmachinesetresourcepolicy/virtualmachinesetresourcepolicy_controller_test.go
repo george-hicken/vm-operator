@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/go-logr/logr"
 	. "github.com/onsi/ginkgo/v2"
@@ -26,6 +27,7 @@ import (
 	"github.com/vmware-tanzu/vm-operator/pkg/constants/testlabels"
 	pkgctx "github.com/vmware-tanzu/vm-operator/pkg/context"
 	providerfake "github.com/vmware-tanzu/vm-operator/pkg/providers/fake"
+	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/credentials"
 	"github.com/vmware-tanzu/vm-operator/test/builder"
 )
 
@@ -149,6 +151,45 @@ var _ = Describe("Resource policy shard deletion fence", Label(testlabels.Contro
 		Expect(deleted).To(BeFalse())
 		Expect(getPolicy().Finalizers).To(Equal([]string{finalizer}))
 	})
+})
+
+var _ = Describe("Resource policy provider credentials", Label(testlabels.Controller, testlabels.API), func() {
+	DescribeTable("Result of a provider error",
+		func(providerErr error, expectedResult ctrl.Result, expectedErr error) {
+			ctx := pkgcfg.NewContext()
+			pkgcfg.SetContext(ctx, func(config *pkgcfg.Config) {
+				config.MultiVC = pkgcfg.MultiVC{Mode: pkgcfg.MultiVCModeShard, ShardSDDC: "vc-1"}
+			})
+			policy := &vmopv1.VirtualMachineSetResourcePolicy{ObjectMeta: metav1.ObjectMeta{
+				Name: "policy", Namespace: "ns", UID: "policy-uid",
+			}}
+			c := builder.NewFakeClient(policy)
+			provider := providerfake.NewVMProvider()
+			provider.CreateOrUpdateVirtualMachineSetResourcePolicyFn = func(
+				context.Context, *vmopv1.VirtualMachineSetResourcePolicy) error {
+				return providerErr
+			}
+			r := virtualmachinesetresourcepolicy.NewReconciler(ctx, c, logr.Discard(), provider)
+			r.APIReader = c
+
+			result, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: ctrlclient.ObjectKeyFromObject(policy)})
+			if expectedErr == nil {
+				Expect(err).ToNot(HaveOccurred())
+			} else {
+				Expect(err).To(MatchError(expectedErr))
+			}
+			Expect(result).To(Equal(expectedResult))
+		},
+		Entry("missing credentials Secret requeues after a bounded delay, without an error",
+			fmt.Errorf("cannot find secret for provider credentials: %w: %w",
+				credentials.ErrSecretNotFound,
+				apierrors.NewNotFound(schema.GroupResource{Resource: "secrets"}, "creds")),
+			ctrl.Result{RequeueAfter: 15 * time.Second}, nil),
+		Entry("another provider error is returned",
+			errors.New("boom"), ctrl.Result{}, errors.New("boom")),
+		Entry("provider success is a clean result",
+			nil, ctrl.Result{}, nil),
+	)
 })
 
 var _ = Describe("Resource policy deferred patch",
